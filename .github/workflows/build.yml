@@ -30,6 +30,14 @@ jobs:
       - name: Thêm nền tảng Android vào project Capacitor
         run: npx cap add android
 
+      - name: Đặt minSdkVersion = 29 (chỉ hỗ trợ Android 10 trở lên)
+        # Bản này bỏ toàn bộ code xử lý lưu trữ kiểu cũ (WRITE_EXTERNAL_STORAGE +
+        # FileProvider) cho Android 9 trở xuống, chỉ dùng MediaStore/scoped storage
+        # của Android 10+. Do đó BẮT BUỘC nâng minSdkVersion để chặn cài trên máy
+        # cũ hơn — nếu không, tính năng "Lưu âm thanh" sẽ báo lỗi lúc chạy (không
+        # crash cứng, nhưng không dùng được) trên các máy Android 9 trở xuống.
+        run: sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
+
       - name: Bật hỗ trợ biên dịch Kotlin cho project Android
         run: |
           sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"/}' android/build.gradle
@@ -41,19 +49,6 @@ jobs:
           mkdir -p android/app/src/main/java/com/docdoc/app
           cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/TtsFileSaverPlugin.kt
           cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/MainActivity.java
-
-      - name: Copy file_paths.xml (cấu hình cho FileProvider)
-        run: |
-          mkdir -p android/app/src/main/res/xml
-          cp native-plugin/res/xml/file_paths.xml android/app/src/main/res/xml/file_paths.xml
-
-      - name: Bổ sung quyền lưu trữ + khai báo FileProvider vào AndroidManifest.xml
-        # BẮT BUỘC: nếu thiếu bước này, tính năng "Lưu âm thanh (file WAV)" sẽ
-        # CRASH ngay lập tức trên mọi máy Android 9 trở xuống (API <= 28), vì
-        # plugin gọi FileProvider.getUriForFile() nhưng project mặc định của
-        # Capacitor KHÔNG tự khai báo provider này (chỉ có khi cài thêm
-        # @capacitor/camera hoặc @capacitor/filesystem).
-        run: python3 scripts/patch_manifest.py
 
       - name: Đồng bộ Capacitor
         run: npx cap sync android
