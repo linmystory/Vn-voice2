@@ -8,6 +8,16 @@ package com.docdoc.app
 // sẵn của hệ điều hành Android — hoàn toàn offline, không cần API key hay
 // dịch vụ đám mây nào.
 //
+// PHIÊN BẢN ĐÃ VÁ LỖI (bản "hoàn thiện"):
+//   - Báo trạng thái engine rõ ràng (đang tải / sẵn sàng / lỗi) qua
+//     getEngineStatus(), thay vì để JS chờ vô thời hạn với thông báo mơ hồ.
+//   - Toàn bộ luồng nền được bọc try/catch(Throwable) để một lỗi bất ngờ
+//     (kể cả OutOfMemoryError khi ghép file quá dài) không làm crash cả ứng
+//     dụng, mà chỉ trả lỗi có kiểm soát về cho JS.
+//   - Kiểm tra kết quả setLanguage()/setVoice() để tự động rơi về giọng mặc
+//     định khi ngôn ngữ yêu cầu không có sẵn trên máy, thay vì đọc sai giọng
+//     mà không báo gì.
+//
 // ĐÃ THU GỌN: bản này CHỈ HỖ TRỢ ANDROID 10 (API 29) TRỞ LÊN.
 // Từ Android 10, việc ghi file vào bộ nhớ công khai dùng MediaStore + scoped
 // storage nên:
@@ -39,6 +49,7 @@ import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import android.util.Log
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -51,15 +62,33 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 @CapacitorPlugin(name = "TtsFileSaver")
 class TtsFileSaverPlugin : Plugin() {
 
+    companion object {
+        private const val TAG = "TtsFileSaverPlugin"
+
+        // Trạng thái engine TTS, JS dùng để hiển thị đúng thông báo thay vì
+        // đoán mò khi mọi lệnh đều bị reject với cùng 1 câu chung chung.
+        private const val STATUS_LOADING = "loading"
+        private const val STATUS_READY = "ready"
+        private const val STATUS_ERROR = "error"
+    }
+
     private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private val executor = Executors.newSingleThreadExecutor()
+
+    @Volatile private var engineStatus: String = STATUS_LOADING
+
+    @Volatile private var engineErrorMessage: String = ""
+
+    // executor riêng cho toàn bộ thao tác TTS (đồng bộ hoá truy cập engine),
+    // isShutdown/isTerminated được kiểm tra trước khi execute() để tránh
+    // RejectedExecutionException sau khi Activity đã bị huỷ.
+    private var executor: ExecutorService = Executors.newSingleThreadExecutor()
 
     // Độ dài an toàn mỗi đoạn văn bản gửi cho TTS (ký tự). Android TTS có giới
     // hạn thực tế do TextToSpeech.getMaxSpeechInputLength() cung cấp, nhưng ta
@@ -68,8 +97,81 @@ class TtsFileSaverPlugin : Plugin() {
 
     override fun load() {
         super.load()
-        tts = TextToSpeech(context) { status ->
-            ttsReady = (status == TextToSpeech.SUCCESS)
+        try {
+            tts = TextToSpeech(context) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    engineStatus = STATUS_READY
+                } else {
+                    engineStatus = STATUS_ERROR
+                    engineErrorMessage =
+                        "Không khởi tạo được bộ máy Text-to-Speech (mã lỗi $status). " +
+                        "Máy có thể chưa cài ứng dụng chuyển văn bản thành giọng nói nào."
+                    Log.e(TAG, engineErrorMessage)
+                }
+            }
+        } catch (t: Throwable) {
+            // Một số thiết bị OEM (ROM tuỳ biến, không có Google TTS/Samsung TTS)
+            // có thể ném lỗi ngay khi khởi tạo TextToSpeech thay vì trả status lỗi
+            // qua callback. Bắt lại ở đây để tránh crash cả ứng dụng lúc mở app.
+            engineStatus = STATUS_ERROR
+            engineErrorMessage = "Không thể khởi tạo Text-to-Speech: ${t.message}"
+            Log.e(TAG, engineErrorMessage, t)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cho JS hỏi trạng thái engine hiện tại, để hiển thị đúng thông báo
+    // (đang tải / sẵn sàng / lỗi kèm lý do) thay vì đoán.
+    // ------------------------------------------------------------------
+    @PluginMethod
+    fun getEngineStatus(call: PluginCall) {
+        val ret = JSObject()
+        ret.put("status", engineStatus)
+        ret.put("message", engineErrorMessage)
+        call.resolve(ret)
+    }
+
+    private fun ensureReadyOrReject(call: PluginCall): Boolean {
+        return when (engineStatus) {
+            STATUS_READY -> true
+            STATUS_ERROR -> {
+                call.reject(
+                    engineErrorMessage.ifBlank {
+                        "Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng."
+                    }
+                )
+                false
+            }
+            else -> {
+                call.reject("Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.")
+                false
+            }
+        }
+    }
+
+    private fun runOnExecutor(call: PluginCall, task: () -> Unit) {
+        if (executor.isShutdown || executor.isTerminated) {
+            call.reject("Ứng dụng đang đóng, không thể xử lý yêu cầu này.")
+            return
+        }
+        try {
+            executor.execute {
+                try {
+                    task()
+                } catch (t: Throwable) {
+                    // Lưới an toàn cuối cùng: bất kỳ lỗi không lường trước nào
+                    // (kể cả OutOfMemoryError) đều được bắt lại ở đây để KHÔNG
+                    // làm sập tiến trình ứng dụng, chỉ báo lỗi có kiểm soát.
+                    Log.e(TAG, "Lỗi không mong muốn trong tác vụ TTS: ${t.message}", t)
+                    try {
+                        call.reject("Đã xảy ra lỗi không mong muốn: ${t.message}")
+                    } catch (_: Throwable) {
+                        // call có thể đã được resolve/reject trước đó, bỏ qua.
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            call.reject("Không thể lên lịch tác vụ TTS: ${t.message}")
         }
     }
 
@@ -83,10 +185,7 @@ class TtsFileSaverPlugin : Plugin() {
             call.reject("Thiếu văn bản cần đọc (text).")
             return
         }
-        if (!ttsReady || tts == null) {
-            call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
-            return
-        }
+        if (!ensureReadyOrReject(call)) return
         // Android 10+ dùng MediaStore/scoped storage => không cần xin quyền
         // lưu trữ lúc chạy, tổng hợp file ngay.
         doSynthesizeToFile(call)
@@ -104,19 +203,28 @@ class TtsFileSaverPlugin : Plugin() {
         val rate = (call.getFloat("rate") ?: 1.0f)
         val pitch = (call.getFloat("pitch") ?: 1.0f)
 
-        executor.execute {
+        runOnExecutor(call) {
             var tmpDir: File? = null
             var mergedFile: File? = null
             try {
-                applyVoiceSettings(voiceName, lang, rate, pitch)
+                val engine = tts
+                if (engine == null) {
+                    call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                    return@runOnExecutor
+                }
+
+                applyVoiceSettings(engine, voiceName, lang, rate, pitch)
                 val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
                 if (chunks.isEmpty()) {
                     call.reject("Văn bản rỗng sau khi xử lý.")
-                    return@execute
+                    return@runOnExecutor
                 }
 
                 val workDir = File(context.cacheDir, "tts_tmp_${System.currentTimeMillis()}")
-                workDir.mkdirs()
+                if (!workDir.mkdirs() && !workDir.exists()) {
+                    call.reject("Không tạo được thư mục tạm để xử lý âm thanh.")
+                    return@runOnExecutor
+                }
                 tmpDir = workDir
 
                 val chunkFiles = ArrayList<File>()
@@ -149,17 +257,27 @@ class TtsFileSaverPlugin : Plugin() {
                         }
                     }
 
-                    tts!!.setOnUtteranceProgressListener(listener)
+                    engine.setOnUtteranceProgressListener(listener)
 
                     val params = Bundle()
-                    val result = tts!!.synthesizeToFile(chunkText, params, chunkFile, utteranceId)
+                    val result = try {
+                        engine.synthesizeToFile(chunkText, params, chunkFile, utteranceId)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "synthesizeToFile ném lỗi ở đoạn ${index + 1}: ${t.message}", t)
+                        TextToSpeech.ERROR
+                    }
                     if (result != TextToSpeech.SUCCESS) {
                         thisChunkFailed = true
                         latch.countDown()
                     }
 
                     // Chờ tối đa 20 giây cho mỗi đoạn (đoạn đã được giới hạn ngắn nên rất hiếm khi cần lâu vậy)
-                    val finished = latch.await(20, TimeUnit.SECONDS)
+                    val finished = try {
+                        latch.await(20, TimeUnit.SECONDS)
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        false
+                    }
                     if (!finished || thisChunkFailed || !chunkFile.exists() || chunkFile.length() == 0L) {
                         synthesisFailed = true
                         failMessage = "Không thể tổng hợp đoạn văn bản thứ ${index + 1}/${chunks.size}."
@@ -169,28 +287,24 @@ class TtsFileSaverPlugin : Plugin() {
                 }
 
                 if (synthesisFailed) {
-                    workDir.deleteRecursively()
                     call.reject(failMessage)
-                    return@execute
+                    return@runOnExecutor
                 }
 
                 // Ghép các file WAV nhỏ thành 1 file WAV hoàn chỉnh
                 val outFile = File(context.cacheDir, "tts_output_${System.currentTimeMillis()}.wav")
                 mergedFile = outFile
                 mergeWavFiles(chunkFiles, outFile)
-                workDir.deleteRecursively()
 
                 // Lưu file vào bộ nhớ công khai (Music/DocDocTTS) qua MediaStore
                 // (Android 10+, không cần xin quyền runtime), đồng thời trả về
                 // content Uri để JS có thể chia sẻ/mở file.
                 val fileName = "doc-van-ban-${System.currentTimeMillis()}.wav"
                 val savedUri = saveWavToPublicStorage(outFile, fileName)
-                outFile.delete()
-                mergedFile = null
 
                 if (savedUri == null) {
                     call.reject("Không thể lưu file âm thanh vào bộ nhớ thiết bị.")
-                    return@execute
+                    return@runOnExecutor
                 }
 
                 val ret = JSObject()
@@ -198,13 +312,23 @@ class TtsFileSaverPlugin : Plugin() {
                 ret.put("fileName", fileName)
                 call.resolve(ret)
 
+            } catch (oom: OutOfMemoryError) {
+                // Văn bản quá dài / quá nhiều đoạn có thể khiến bước ghép file
+                // tốn nhiều bộ nhớ. Bắt riêng OOM để trả lỗi rõ ràng thay vì để
+                // tiến trình bị hệ điều hành giết (crash im lặng).
+                Log.e(TAG, "Hết bộ nhớ khi tạo file âm thanh", oom)
+                call.reject("Văn bản quá dài khiến thiết bị hết bộ nhớ khi xử lý. Vui lòng thử với đoạn văn bản ngắn hơn.")
+            } catch (io: IOException) {
+                Log.e(TAG, "Lỗi I/O khi tạo file âm thanh: ${io.message}", io)
+                call.reject("Lỗi khi ghi file âm thanh: ${io.message}")
             } catch (e: Exception) {
+                Log.e(TAG, "Lỗi khi tạo file âm thanh: ${e.message}", e)
                 call.reject("Lỗi khi tạo file âm thanh: ${e.message}", e)
             } finally {
                 // Dọn dẹp file/thư mục tạm nếu còn sót lại do lỗi giữa chừng,
                 // tránh rác tích lũy trong cache theo thời gian.
-                try { tmpDir?.deleteRecursively() } catch (_: Exception) {}
-                try { mergedFile?.delete() } catch (_: Exception) {}
+                try { tmpDir?.deleteRecursively() } catch (_: Throwable) {}
+                try { mergedFile?.delete() } catch (_: Throwable) {}
             }
         }
     }
@@ -214,20 +338,27 @@ class TtsFileSaverPlugin : Plugin() {
     // ------------------------------------------------------------------
     @PluginMethod
     fun getVoices(call: PluginCall) {
-        if (!ttsReady || tts == null) {
-            call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
-            return
+        if (!ensureReadyOrReject(call)) return
+        try {
+            val engine = tts
+            if (engine == null) {
+                call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                return
+            }
+            val arr = JSArray()
+            engine.voices?.forEach { v ->
+                val obj = JSObject()
+                obj.put("name", v.name)
+                obj.put("lang", v.locale.toLanguageTag())
+                arr.put(obj)
+            }
+            val ret = JSObject()
+            ret.put("voices", arr)
+            call.resolve(ret)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Lỗi khi lấy danh sách giọng đọc: ${t.message}", t)
+            call.reject("Không lấy được danh sách giọng đọc: ${t.message}")
         }
-        val arr = JSArray()
-        tts!!.voices?.forEach { v ->
-            val obj = JSObject()
-            obj.put("name", v.name)
-            obj.put("lang", v.locale.toLanguageTag())
-            arr.put(obj)
-        }
-        val ret = JSObject()
-        ret.put("voices", arr)
-        call.resolve(ret)
     }
 
     // ------------------------------------------------------------------
@@ -247,24 +378,26 @@ class TtsFileSaverPlugin : Plugin() {
             call.reject("Thiếu văn bản cần đọc (text).")
             return
         }
-        if (!ttsReady || tts == null) {
-            call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
-            return
-        }
+        if (!ensureReadyOrReject(call)) return
 
         val voiceName = call.getString("voiceName") ?: ""
         val lang = call.getString("lang") ?: "vi-VN"
         val rate = (call.getFloat("rate") ?: 1.0f)
         val pitch = (call.getFloat("pitch") ?: 1.0f)
 
-        executor.execute {
+        runOnExecutor(call) {
+            val engine = tts
+            if (engine == null) {
+                call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                return@runOnExecutor
+            }
             try {
                 speakCancelled = false
-                applyVoiceSettings(voiceName, lang, rate, pitch)
+                applyVoiceSettings(engine, voiceName, lang, rate, pitch)
                 val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
                 if (chunks.isEmpty()) {
                     call.reject("Văn bản rỗng sau khi xử lý.")
-                    return@execute
+                    return@runOnExecutor
                 }
 
                 for ((index, chunkText) in chunks.withIndex()) {
@@ -287,31 +420,52 @@ class TtsFileSaverPlugin : Plugin() {
                             if (id == utteranceId) { errored = true; latch.countDown() }
                         }
                     }
-                    tts!!.setOnUtteranceProgressListener(listener)
+                    engine.setOnUtteranceProgressListener(listener)
 
                     val params = Bundle()
                     val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-                    tts!!.speak(chunkText, queueMode, params, utteranceId)
+                    val result = try {
+                        engine.speak(chunkText, queueMode, params, utteranceId)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "speak() ném lỗi ở đoạn ${index + 1}: ${t.message}", t)
+                        TextToSpeech.ERROR
+                    }
+                    if (result != TextToSpeech.SUCCESS) {
+                        errored = true
+                        latch.countDown()
+                    }
 
-                    latch.await(30, TimeUnit.SECONDS)
+                    try {
+                        latch.await(30, TimeUnit.SECONDS)
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
                     currentLatch = null
                     if (speakCancelled || errored) break
                 }
                 call.resolve()
-            } catch (e: Exception) {
-                call.reject("Lỗi khi đọc văn bản: ${e.message}", e)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Lỗi khi đọc văn bản: ${t.message}", t)
+                call.reject("Lỗi khi đọc văn bản: ${t.message}")
             }
         }
     }
 
     @PluginMethod
     fun stopSpeaking(call: PluginCall) {
-        speakCancelled = true
-        tts?.stop()
-        // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
-        // tiếp theo (xếp hàng sau trên cùng 1 executor) phải chờ tới 30 giây.
-        currentLatch?.countDown()
-        call.resolve()
+        try {
+            speakCancelled = true
+            tts?.stop()
+            // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
+            // tiếp theo (xếp hàng sau trên cùng 1 executor) phải chờ tới 30 giây.
+            currentLatch?.countDown()
+            call.resolve()
+        } catch (t: Throwable) {
+            // Dừng đọc không phải là thao tác quan trọng tới mức phải làm app
+            // crash nếu có lỗi lạ; báo lỗi nhẹ nhàng cho JS là đủ.
+            Log.e(TAG, "Lỗi khi dừng đọc: ${t.message}", t)
+            call.reject("Lỗi khi dừng đọc: ${t.message}")
+        }
     }
 
     // ------------------------------------------------------------------
@@ -334,38 +488,86 @@ class TtsFileSaverPlugin : Plugin() {
             chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(chooser)
             call.resolve()
-        } catch (e: Exception) {
-            call.reject("Không thể mở hộp thoại chia sẻ: ${e.message}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Không thể mở hộp thoại chia sẻ: ${t.message}", t)
+            call.reject("Không thể mở hộp thoại chia sẻ: ${t.message}")
         }
     }
 
     // ------------------------------------------------------------------
-    // Chọn giọng nói + áp dụng tốc độ/cao độ cho TTS engine
+    // Chọn giọng nói + áp dụng tốc độ/cao độ cho TTS engine.
+    // Nếu ngôn ngữ yêu cầu không có sẵn trên máy, tự rơi về giọng mặc định
+    // của engine thay vì im lặng đọc sai giọng (hoặc đọc lỗi) mà không báo.
     // ------------------------------------------------------------------
-    private fun applyVoiceSettings(voiceName: String, lang: String, rate: Float, pitch: Float) {
-        val engine = tts ?: return
+    private fun applyVoiceSettings(engine: TextToSpeech, voiceName: String, lang: String, rate: Float, pitch: Float) {
         var chosenVoice: Voice? = null
 
         if (voiceName.isNotBlank()) {
-            chosenVoice = engine.voices?.firstOrNull { it.name == voiceName }
+            chosenVoice = try {
+                engine.voices?.firstOrNull { it.name == voiceName }
+            } catch (t: Throwable) {
+                null
+            }
         }
         if (chosenVoice == null && lang.isNotBlank()) {
             val locale = parseLocale(lang)
-            chosenVoice = engine.voices?.firstOrNull { it.locale.language == locale.language }
-        }
-        if (chosenVoice != null) {
-            engine.voice = chosenVoice
-        } else if (lang.isNotBlank()) {
-            engine.language = parseLocale(lang)
+            chosenVoice = try {
+                engine.voices?.firstOrNull { it.locale.language == locale.language }
+            } catch (t: Throwable) {
+                null
+            }
         }
 
-        engine.setSpeechRate(rate)
-        engine.setPitch(pitch)
+        if (chosenVoice != null) {
+            val voiceResult = try {
+                engine.setVoice(chosenVoice)
+                TextToSpeech.SUCCESS
+            } catch (t: Throwable) {
+                Log.w(TAG, "setVoice thất bại: ${t.message}")
+                TextToSpeech.ERROR
+            }
+            if (voiceResult != TextToSpeech.SUCCESS) {
+                applyLanguageFallback(engine, lang)
+            }
+        } else if (lang.isNotBlank()) {
+            applyLanguageFallback(engine, lang)
+        }
+
+        try {
+            engine.setSpeechRate(rate.coerceIn(0.1f, 4.0f))
+            engine.setPitch(pitch.coerceIn(0.1f, 2.0f))
+        } catch (t: Throwable) {
+            Log.w(TAG, "Không áp dụng được tốc độ/cao độ giọng đọc: ${t.message}")
+        }
+    }
+
+    // Đặt ngôn ngữ, kiểm tra kết quả trả về. Nếu ngôn ngữ không được engine
+    // hỗ trợ (LANG_MISSING_DATA hoặc LANG_NOT_SUPPORTED), rơi về tiếng Anh
+    // (thường có sẵn trên mọi máy Android) thay vì để engine ở trạng thái
+    // không xác định.
+    private fun applyLanguageFallback(engine: TextToSpeech, lang: String) {
+        val locale = parseLocale(lang)
+        val result = try {
+            engine.setLanguage(locale)
+        } catch (t: Throwable) {
+            TextToSpeech.LANG_NOT_SUPPORTED
+        }
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            Log.w(TAG, "Ngôn ngữ '$lang' không được hỗ trợ (mã $result), chuyển sang tiếng Anh mặc định.")
+            try {
+                engine.setLanguage(Locale.US)
+            } catch (t: Throwable) {
+                // Nếu cả tiếng Anh cũng lỗi thì để engine dùng ngôn ngữ hiện tại,
+                // vẫn tốt hơn là ném lỗi làm hỏng toàn bộ tác vụ đọc/lưu file.
+                Log.w(TAG, "Không đặt được cả ngôn ngữ dự phòng: ${t.message}")
+            }
+        }
     }
 
     private fun parseLocale(bcp47: String): Locale {
         return try {
-            Locale.forLanguageTag(bcp47)
+            val locale = Locale.forLanguageTag(bcp47)
+            if (locale.language.isBlank()) Locale("vi", "VN") else locale
         } catch (e: Exception) {
             Locale("vi", "VN")
         }
@@ -507,6 +709,8 @@ class TtsFileSaverPlugin : Plugin() {
     // Ghép nhiều file WAV nhỏ thành 1 file WAV hoàn chỉnh (dùng chung định dạng
     // âm thanh của file đầu tiên; chỉ ghi phần dữ liệu PCM thật của mỗi file,
     // xác định đúng vị trí nhờ readWavInfo ở trên thay vì offset cố định).
+    // Đọc/ghi theo luồng bằng bộ đệm cố định 8KB để tránh nạp cả file vào RAM
+    // (an toàn hơn với văn bản dài, giảm nguy cơ OutOfMemoryError).
     // ------------------------------------------------------------------
     private fun mergeWavFiles(files: List<File>, outFile: File) {
         if (files.isEmpty()) throw IOException("Không có đoạn âm thanh nào để ghép.")
@@ -544,6 +748,15 @@ class TtsFileSaverPlugin : Plugin() {
         byteRate: Int,
         blockAlign: Int
     ) {
+        // WAV chuẩn (RIFF) dùng trường 32-bit cho kích thước, tức tối đa ~4GB.
+        // Với văn bản 25.000 ký tự ở tốc độ đọc bình thường, dữ liệu PCM sinh
+        // ra không thể chạm ngưỡng này, nhưng vẫn chặn tường minh để báo lỗi
+        // rõ ràng thay vì ghi ra 1 file WAV hỏng (giá trị âm/tràn số) nếu có
+        // trường hợp bất thường nào đó phát sinh văn bản khổng lồ.
+        if (dataSize > 0xFFFFFFFFL - 36L) {
+            throw IOException("Dữ liệu âm thanh quá lớn để ghi thành 1 file WAV (vượt giới hạn 4GB).")
+        }
+
         val totalDataLen = dataSize + 36
         val header = ByteArray(44)
 
@@ -608,21 +821,40 @@ class TtsFileSaverPlugin : Plugin() {
         val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val itemUri = resolver.insert(collection, values) ?: return null
 
-        resolver.openOutputStream(itemUri)?.use { out ->
-            FileInputStream(sourceFile).use { input ->
-                input.copyTo(out)
+        var writeOk = false
+        try {
+            resolver.openOutputStream(itemUri)?.use { out ->
+                FileInputStream(sourceFile).use { input ->
+                    input.copyTo(out)
+                }
+                writeOk = true
             }
-        } ?: return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "Lỗi khi ghi dữ liệu vào MediaStore: ${t.message}", t)
+        }
+
+        if (!writeOk) {
+            // Ghi thất bại giữa chừng: xoá bản ghi "pending" rác thay vì để lại
+            // 1 file 0-byte hiển thị trong Music của người dùng.
+            try { resolver.delete(itemUri, null, null) } catch (_: Throwable) {}
+            return null
+        }
 
         values.clear()
         values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-        resolver.update(itemUri, values, null, null)
+        try {
+            resolver.update(itemUri, values, null, null)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Lỗi khi hoàn tất bản ghi MediaStore: ${t.message}", t)
+            return null
+        }
         return itemUri
     }
 
     override fun handleOnDestroy() {
         super.handleOnDestroy()
-        tts?.shutdown()
-        executor.shutdownNow()
+        try { tts?.stop() } catch (_: Throwable) {}
+        try { tts?.shutdown() } catch (_: Throwable) {}
+        try { executor.shutdownNow() } catch (_: Throwable) {}
     }
 }
