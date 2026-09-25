@@ -84,3 +84,45 @@ File APK sẽ nằm ở `android/app/build/outputs/apk/debug/app-debug.apk`.
 - Ứng dụng yêu cầu **Android 10 (API 29) trở lên**. Vì `minSdkVersion` đã đặt
   là 29, máy chạy Android 9 trở xuống sẽ **không cài được** ứng dụng (thay vì
   cài được rồi lỗi lúc dùng), tránh gây nhầm lẫn cho người dùng.
+
+---
+
+## Khắc phục sự cố (Troubleshooting)
+
+**App mở lên nhưng báo "Không có bộ đọc khả dụng" / "Không tìm thấy giọng đọc":**
+Máy chưa cài engine Text-to-Speech nào (thường gặp trên máy Trung Quốc,
+ROM tuỳ biến đã gỡ Google TTS). Vào **Cài đặt > Ngôn ngữ & nhập liệu >
+Chuyển văn bản thành giọng nói (Text-to-speech)**, chọn một engine (Google
+TTS hoặc Samsung TTS) và tải gói giọng tiếng Việt. Đây không phải lỗi của
+ứng dụng — plugin đã được vá để phát hiện và báo đúng tình huống này thay vì
+treo vô thời hạn.
+
+**Build GitHub Actions báo lỗi ở bước `sed` (không tìm thấy `minSdkVersion`
+hoặc `dependencies {`):**
+Điều này xảy ra nếu một phiên bản Capacitor mới hơn đổi cấu trúc file
+`android/variables.gradle` hoặc `android/build.gradle`. Cách xử lý:
+1. Mở log của bước bị lỗi trong tab Actions để xem `sed` không khớp được
+   dòng nào.
+2. Mở file tương ứng (`android/variables.gradle` hoặc `android/build.gradle`)
+   sau bước `npx cap add android`, sửa tay dòng `minSdkVersion` thành `29`
+   hoặc thêm thủ công dòng `classpath` Kotlin vào đúng khối `dependencies {}`
+   trong `buildscript`.
+3. Có thể ghim lại phiên bản Capacitor cũ hơn (đã test hoạt động tốt) trong
+   `package.json` nếu không muốn sửa lại script `sed`.
+
+**Build lỗi vì xung đột phiên bản Kotlin/AGP:**
+Thử nâng số phiên bản `kotlin-gradle-plugin` và `kotlin-stdlib` trong
+`.github/workflows/build.yml` lên bản mới hơn tương thích với phiên bản
+Android Gradle Plugin (AGP) mà `npx cap add android` tạo ra, hoặc hạ phiên
+bản `@capacitor/android` trong `package.json` xuống bản đã biết chạy ổn.
+
+**Bấm "Lưu âm thanh" báo "hết bộ nhớ" với văn bản rất dài:**
+Giảm bớt độ dài văn bản (ứng dụng đã giới hạn 25.000 ký tự ở khung nhập),
+hoặc chia văn bản thành nhiều lần lưu file nhỏ hơn. Bản vá đã bắt riêng lỗi
+`OutOfMemoryError` để báo rõ nguyên nhân thay vì làm ứng dụng đóng đột ngột.
+
+**App đọc giọng bị sai ngôn ngữ / đọc bằng giọng tiếng Anh dù đã nhập tiếng
+Việt:** Máy chưa cài gói giọng tiếng Việt cho engine TTS đang dùng. Plugin
+đã được vá để tự động rơi về tiếng Anh (thay vì lỗi hẳn) khi ngôn ngữ yêu
+cầu không có sẵn — hãy cài thêm giọng tiếng Việt theo hướng dẫn ở mục
+"Không có bộ đọc khả dụng" phía trên để giọng đọc đúng như mong muốn.
