@@ -23,6 +23,19 @@
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
+  /* Co giãn cho màn hình rất nhỏ (một số máy Android giá rẻ ~320-360px) */
+  @media (max-width: 360px) {
+    header h1 { font-size: 19px; }
+    .card { padding: 12px; }
+    textarea { min-height: 150px; font-size: 14px; }
+    .btn-main { padding: 15px; font-size: 15px; }
+    .btn-sub { padding: 12px; font-size: 14px; }
+  }
+  /* Màn hình lớn hơn (tablet Android) vẫn giữ layout gọn, không bị kéo giãn quá rộng */
+  @media (min-width: 900px) {
+    .app { max-width: 720px; }
+  }
+
   html, body {
     height: 100%;
     background: var(--bg-main);
@@ -333,6 +346,30 @@
 
 <script>
 (function () {
+  // ---------- Lưới an toàn toàn cục ----------
+  // Bắt mọi lỗi JS không lường trước (kể cả lỗi trong promise bị bỏ quên
+  // .catch) để hiển thị toast thay vì để WebView hiển thị màn hình trắng
+  // hoặc coi như ứng dụng bị treo. Không dùng preventDefault() cho lỗi cú
+  // pháp nghiêm trọng (sẽ không tới được đây vì file sẽ không parse được),
+  // chỉ áp dụng cho lỗi runtime xảy ra sau khi app đã chạy.
+  window.addEventListener('error', function (event) {
+    try {
+      console.error('Lỗi runtime không mong muốn:', event.error || event.message);
+      if (typeof showToast === 'function') {
+        showToast('Đã xảy ra lỗi, vui lòng thử lại: ' + (event.message || 'không rõ nguyên nhân'), true);
+      }
+    } catch (_) { /* không để lỗi trong chính trình xử lý lỗi làm hỏng thêm gì */ }
+  });
+  window.addEventListener('unhandledrejection', function (event) {
+    try {
+      const reason = event && event.reason ? (event.reason.message || String(event.reason)) : 'không rõ nguyên nhân';
+      console.error('Promise bị từ chối không được xử lý:', reason);
+      if (typeof showToast === 'function') {
+        showToast('Đã xảy ra lỗi: ' + reason, true);
+      }
+    } catch (_) { /* bỏ qua */ }
+  });
+
   const textInput = document.getElementById('textInput');
   const charCount = document.getElementById('charCount');
   const btnClearText = document.getElementById('btnClearText');
@@ -648,6 +685,16 @@
       return;
     }
 
+    try {
+      const engineStatus = await plugin.getEngineStatus();
+      if (engineStatus && engineStatus.status === 'error') {
+        showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
+        return;
+      }
+    } catch (e) {
+      // Plugin cũ không có getEngineStatus: bỏ qua, để speak() tự báo lỗi.
+    }
+
     const voice = getSelectedVoice();
 
     btnSpeak.disabled = true;
@@ -818,6 +865,21 @@
       return;
     }
 
+    try {
+      const engineStatus = await plugin.getEngineStatus();
+      if (engineStatus && engineStatus.status === 'error') {
+        showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
+        return;
+      }
+      if (engineStatus && engineStatus.status === 'loading') {
+        showToast('Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.', true);
+        return;
+      }
+    } catch (e) {
+      // Plugin cũ không có getEngineStatus: bỏ qua bước kiểm tra trước, để
+      // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
+    }
+
     const voice = getSelectedVoice();
 
     try {
@@ -851,6 +913,32 @@
   });
 
 
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Chờ engine native báo "ready" hoặc "error", thăm dò tối đa ~6 giây.
+  // Tránh việc báo lỗi ngay lập tức trong khi engine Android vẫn đang khởi
+  // tạo bất đồng bộ (thường mất 1-2 giây sau khi app mở).
+  async function waitForNativeEngineStatus(plugin, maxWaitMs) {
+    const start = Date.now();
+    let last = null;
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        last = await plugin.getEngineStatus();
+        if (last && (last.status === 'ready' || last.status === 'error')) {
+          return last;
+        }
+      } catch (e) {
+        // Nếu plugin còn quá cũ / không có getEngineStatus, coi như không xác
+        // định được trạng thái và thử thẳng getVoices() bên dưới.
+        return null;
+      }
+      await delay(400);
+    }
+    return last;
+  }
+
   async function tryNativeFallback() {
     const plugin = getNativeTtsPlugin();
     if (!plugin) {
@@ -861,15 +949,38 @@
       ttsMode = 'none';
       return;
     }
+
+    statusText.textContent = 'Đang khởi động bộ đọc...';
+
+    try {
+      const engineStatus = await waitForNativeEngineStatus(plugin, 6000);
+      if (engineStatus && engineStatus.status === 'error') {
+        showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
+        btnSpeak.disabled = true;
+        btnReplay.disabled = true;
+        statusText.textContent = 'Không có bộ đọc khả dụng';
+        ttsMode = 'none';
+        return;
+      }
+    } catch (e) {
+      // Không xác định được trạng thái engine, vẫn thử getVoices() bên dưới
+      // để tương thích ngược với plugin cũ hơn.
+    }
+
     try {
       const result = await plugin.getVoices();
       const voices = (result && result.voices) || [];
       if (voices.length === 0) {
         showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
+        btnSpeak.disabled = true;
+        btnReplay.disabled = true;
+        statusText.textContent = 'Không có giọng đọc';
         ttsMode = 'none';
         return;
       }
       ttsMode = 'native';
+      btnSpeak.disabled = false;
+      btnReplay.disabled = false;
       allVoices = voices;
       voicesByEngine = { 'Bộ đọc hệ thống Android': voices };
       engineSelect.innerHTML = '';
@@ -881,40 +992,56 @@
       populateVoiceSelect('Bộ đọc hệ thống Android');
       statusText.textContent = 'Sẵn sàng';
     } catch (e) {
-      showToast('Không lấy được danh sách giọng đọc: ' + (e.message || e), true);
+      const msg = (e && e.message) ? e.message : String(e);
+      showToast('Không lấy được danh sách giọng đọc: ' + msg, true);
+      btnSpeak.disabled = true;
+      btnReplay.disabled = true;
+      statusText.textContent = 'Lỗi bộ đọc';
       ttsMode = 'none';
     }
   }
 
   function init() {
-    updateCharCount();
+    try {
+      updateCharCount();
 
-    if (!synthSupported) {
+      if (!synthSupported) {
+        tryNativeFallback();
+        return;
+      }
+
+      ttsMode = 'web';
+      if (!loadVoices()) {
+        // Một số trình duyệt Android cần chờ sự kiện voiceschanged
+        window.speechSynthesis.onvoiceschanged = () => {
+          try { loadVoices(); } catch (e) { console.error(e); }
+        };
+        // fallback: thử lại sau 500ms phòng khi sự kiện không bắn
+        setTimeout(() => {
+          try { if (allVoices.length === 0) loadVoices(); } catch (e) { console.error(e); }
+        }, 500);
+        // Nếu sau 2 giây vẫn không có giọng nào -> WebView không hỗ trợ đầy đủ,
+        // chuyển sang dùng plugin native để đảm bảo app vẫn đọc được
+        setTimeout(() => {
+          if (allVoices.length === 0) {
+            tryNativeFallback();
+          }
+        }, 2000);
+      }
+    } catch (e) {
+      console.error('Lỗi khi khởi động ứng dụng:', e);
+      showToast('Không thể khởi động bộ đọc giọng nói. Vui lòng khởi động lại ứng dụng.', true);
+      statusText.textContent = 'Lỗi khởi động';
+      // Thử phương án dự phòng cuối cùng: plugin native, để app vẫn có cơ hội hoạt động.
       tryNativeFallback();
-      return;
-    }
-
-    ttsMode = 'web';
-    if (!loadVoices()) {
-      // Một số trình duyệt Android cần chờ sự kiện voiceschanged
-      window.speechSynthesis.onvoiceschanged = () => {
-        loadVoices();
-      };
-      // fallback: thử lại sau 500ms phòng khi sự kiện không bắn
-      setTimeout(() => { if (allVoices.length === 0) loadVoices(); }, 500);
-      // Nếu sau 2 giây vẫn không có giọng nào -> WebView không hỗ trợ đầy đủ,
-      // chuyển sang dùng plugin native để đảm bảo app vẫn đọc được
-      setTimeout(() => {
-        if (allVoices.length === 0) {
-          tryNativeFallback();
-        }
-      }, 2000);
     }
   }
 
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', function () {
+    try { init(); } catch (e) { console.error(e); }
+  });
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    init();
+    try { init(); } catch (e) { console.error(e); }
   }
 })();
 </script>
