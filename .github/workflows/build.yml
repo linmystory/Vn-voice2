@@ -41,7 +41,7 @@ jobs:
         # có hiệu lực từ 31/8/2026, không cần sed riêng cho 2 giá trị này.)
         run: sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
 
-      - name: Khai báo quyền nhìn thấy TẤT CẢ bộ đọc TTS đã cài (package visibility, Android 11+)
+      - name: Khai báo quyền nhìn thấy TẤT CẢ bộ đọc TTS đã cài + quyền WAKE_LOCK
         # NGUYÊN NHÂN GỐC của lỗi "không lấy được hết giọng đọc đã cài trên máy":
         # Từ Android 11 (API 30), hệ thống ẩn bớt danh sách app/dịch vụ khác với
         # app của mình (package visibility) trừ khi app khai báo rõ mình cần
@@ -53,10 +53,18 @@ jobs:
         # chỉ có Google TTS/engine mặc định hệ thống) — các bộ đọc khác người
         # dùng đã cài (Samsung TTS, engine hãng thứ 3, v.v.) bị ẩn đi hoàn
         # toàn, dẫn đến app không sao lấy được voices của chúng dù đã cài.
-        # Sửa: chèn thẳng khối <queries> vào ngay sau thẻ <manifest ...> mở
-        # đầu, làm sibling của <application>, TRƯỚC khi cap sync/build.
+        #
+        # QUYỀN WAKE_LOCK: cần để TtsFileSaverPlugin.kt giữ CPU thức (PARTIAL_
+        # WAKE_LOCK) trong suốt phiên đọc dài — nếu không có quyền này, khi
+        # người dùng khóa màn hình giữa lúc đang đọc, Android có thể đưa CPU
+        # vào Doze làm luồng đọc bị treo, gây audio ngắt giữa chừng. Đây là
+        # quyền "normal" (không nguy hiểm), chỉ cần khai báo trong manifest,
+        # KHÔNG cần xin runtime.
+        #
+        # Cả 2 đều chèn ngay sau thẻ <manifest ...> mở đầu, làm sibling của
+        # <application>, TRƯỚC khi cap sync/build.
         run: |
-          sed -i '/<manifest /a\    <queries>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>' android/app/src/main/AndroidManifest.xml
+          sed -i '/<manifest /a\    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <queries>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>' android/app/src/main/AndroidManifest.xml
           echo "----- AndroidManifest.xml sau khi vá -----"
           cat android/app/src/main/AndroidManifest.xml
 
