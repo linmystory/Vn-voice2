@@ -16,13 +16,13 @@ jobs:
       - name: Cài Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Cài Java (bắt buộc cho Gradle/Android)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - name: Cài các gói phụ thuộc (Capacitor)
         run: npm install
@@ -36,13 +36,16 @@ jobs:
         # của Android 10+. Do đó BẮT BUỘC nâng minSdkVersion để chặn cài trên máy
         # cũ hơn — nếu không, tính năng "Lưu âm thanh" sẽ báo lỗi lúc chạy (không
         # crash cứng, nhưng không dùng được) trên các máy Android 9 trở xuống.
+        # (compileSdkVersion/targetSdkVersion đã tự động = 36 theo template mặc
+        # định của Capacitor 8 — đáp ứng đúng yêu cầu targetSdk 36 của Google Play
+        # có hiệu lực từ 31/8/2026, không cần sed riêng cho 2 giá trị này.)
         run: sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
 
       - name: Bật hỗ trợ biên dịch Kotlin cho project Android
         run: |
-          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"/}' android/build.gradle
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20"/}' android/build.gradle
           sed -i "s/apply plugin: 'com.android.application'/apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'/" android/app/build.gradle
-          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"/}' android/app/build.gradle
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:2.2.20"/}' android/app/build.gradle
 
       - name: Copy plugin native (Kotlin) vào project Android
         run: |
