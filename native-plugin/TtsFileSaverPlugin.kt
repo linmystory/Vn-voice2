@@ -520,6 +520,10 @@ class TtsFileSaverPlugin : Plugin() {
         runOnExecutor(call) {
             val oldTts = tts
             try {
+                // Phòng thủ: nếu vì lý do nào đó vẫn còn giữ AudioFocus từ phiên
+                // đọc trước (lẽ ra JS đã gọi stopSpeaking() trước khi đổi engine),
+                // nhả ra trước khi tạo engine mới để không giữ focus "treo".
+                abandonSpeechAudioFocus()
                 val latch = CountDownLatch(1)
                 var initStatus = TextToSpeech.ERROR
                 val newTts = if (engineName.isBlank()) {
@@ -568,23 +572,31 @@ class TtsFileSaverPlugin : Plugin() {
 
     @PluginMethod
     fun speak(call: PluginCall) {
-        val text = call.getString("text")
-        if (text.isNullOrBlank()) {
-            call.reject("Thiếu văn bản cần đọc (text).")
+        // "chunks": mảng các câu (JS đã tách sẵn bằng splitIntoChunks, dùng
+        // chung với logic Tua lùi/Tua tới). Vẫn nhận "text" đơn lẻ để tương
+        // thích ngược nếu có bản JS cũ hơn chưa gửi mảng.
+        val chunksArray = call.getArray("chunks")
+        val sentences: List<String> = if (chunksArray != null && chunksArray.length() > 0) {
+            (0 until chunksArray.length()).map { i -> chunksArray.optString(i, "") }
+        } else {
+            val text = call.getString("text")
+            if (text.isNullOrBlank()) {
+                call.reject("Thiếu văn bản cần đọc (chunks hoặc text).")
+                return
+            }
+            listOf(text)
+        }
+        if (sentences.isEmpty()) {
+            call.reject("Danh sách câu cần đọc rỗng.")
             return
         }
+        val startIndex = (call.getInt("startIndex") ?: 0).coerceIn(0, sentences.size - 1)
         if (!ensureReadyOrReject(call)) return
 
         val voiceName = call.getString("voiceName") ?: ""
         val lang = call.getString("lang") ?: "vi-VN"
         val rate = (call.getFloat("rate") ?: 1.0f)
         val pitch = (call.getFloat("pitch") ?: 1.0f)
-        // true = đây là câu ĐẦU TIÊN của một phiên đọc mới (mới bấm Phát/Tua/
-        // Tiếp tục) -> cần xin AudioFocus + làm nóng pipeline MỘT LẦN.
-        // false = câu nối tiếp ngay sau câu trước trong CÙNG phiên đọc ->
-        // BỎ QUA bước làm nóng, tránh khoảng lặng + xin/nhả AudioFocus liên
-        // tục giữa các câu — đây chính là nguyên nhân gây tiếng khựng/ngắt
-        // giữa chừng khi JS gọi speak() riêng cho từng câu một.
         val warmup = call.getBoolean("warmup") ?: true
 
         runOnExecutor(call) {
@@ -596,21 +608,11 @@ class TtsFileSaverPlugin : Plugin() {
             try {
                 speakCancelled = false
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
-                val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
-                if (chunks.isEmpty()) {
-                    call.reject("Văn bản rỗng sau khi xử lý.")
-                    return@runOnExecutor
-                }
 
                 if (warmup) {
-                    // Xin AudioFocus TƯỜNG MINH và CHỜ xong trước khi phát bất
-                    // kỳ mẫu âm thanh nào — khắc phục gốc rễ việc mất tiếng đầu
-                    // (xem giải thích chi tiết ở hàm requestSpeechAudioFocus()).
+                    // Xin AudioFocus TƯỜNG MINH và CHỜ xong trước khi phát bất kỳ
+                    // mẫu âm thanh nào — khắc phục việc mất tiếng đầu.
                     requestSpeechAudioFocus()
-                    // Phát thêm một khoảng lặng ngắn để "làm nóng" chính engine
-                    // tổng hợp giọng nói (một số engine cần vài trăm ms để
-                    // khởi động backend synthesis sau khi đổi giọng/rate/pitch
-                    // ở applyVoiceSettings() phía trên).
                     try {
                         engine.playSilentUtterance(300L, TextToSpeech.QUEUE_FLUSH, null)
                     } catch (t: Throwable) {
@@ -618,55 +620,97 @@ class TtsFileSaverPlugin : Plugin() {
                     }
                 }
 
-                for ((index, chunkText) in chunks.withIndex()) {
-                    if (speakCancelled) break
-                    val utteranceId = "speak_chunk_$index"
-                    val latch = CountDownLatch(1)
-                    currentLatch = latch
-                    var errored = false
+                // ------------------------------------------------------------
+                // QUAN TRỌNG (đã sửa lỗi kiến trúc): đọc TOÀN BỘ các câu còn lại
+                // NGAY TRONG MỘT LẦN GỌI này — KHÔNG trả quyền điều khiển về JS
+                // rồi chờ JS gọi lại speak() cho từng câu. Gọi lại theo từng câu
+                // (round-trip JS <-> Kotlin) khiến hàng đợi âm thanh của engine
+                // bị RỖNG giữa 2 câu trong lúc chờ round-trip, buộc audio route
+                // phải khởi động lại y như câu đầu tiên -> gây mất tiếng đầu +
+                // khựng LẶP LẠI ở MỌI câu (đúng lỗi đang gặp). Đọc liền mạch
+                // trong 1 vòng lặp Kotlin duy nhất mới đảm bảo QUEUE_ADD nối
+                // liền các câu mà không có khoảng trống chờ bridge.
+                // Tua lùi/Tua tới vẫn hoạt động được nhờ báo tiến độ qua
+                // notifyListeners("speakProgress") bên dưới, JS chỉ cần lắng
+                // nghe để cập nhật vị trí, không cần tự gọi lại từng câu.
+                // ------------------------------------------------------------
+                var lastIndexReached = startIndex
+                outer@ for (sentenceIndex in startIndex until sentences.size) {
+                    if (speakCancelled) break@outer
+                    lastIndexReached = sentenceIndex
 
-                    val listener = object : UtteranceProgressListener() {
-                        override fun onStart(id: String?) {}
-                        override fun onDone(id: String?) {
-                            if (id == utteranceId) latch.countDown()
-                        }
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(id: String?) {
-                            if (id == utteranceId) { errored = true; latch.countDown() }
-                        }
-                        override fun onError(id: String?, errorCode: Int) {
-                            if (id == utteranceId) { errored = true; latch.countDown() }
-                        }
-                    }
-                    engine.setOnUtteranceProgressListener(listener)
-
-                    val params = Bundle()
-                    // Luôn QUEUE_ADD: nếu warmup=true thì hàng đợi vừa được dọn
-                    // sạch bởi playSilentUtterance(QUEUE_FLUSH) ở trên; nếu
-                    // warmup=false thì câu trước đó (cùng phiên đọc) đã phát
-                    // xong hẳn (đã chờ latch.await ở lần gọi speak() trước),
-                    // hàng đợi engine đang rỗng sẵn — QUEUE_ADD chỉ đơn giản là
-                    // nối câu này vào ngay, không cần flush lại.
-                    val queueMode = TextToSpeech.QUEUE_ADD
-                    val result = try {
-                        engine.speak(chunkText, queueMode, params, utteranceId)
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "speak() ném lỗi ở đoạn ${index + 1}: ${t.message}", t)
-                        TextToSpeech.ERROR
-                    }
-                    if (result != TextToSpeech.SUCCESS) {
-                        errored = true
-                        latch.countDown()
-                    }
-
+                    // Báo cho JS biết ĐANG bắt đầu đọc câu này (để Tua lùi/Tua
+                    // tới và thanh tiến độ luôn khớp với audio thật đang phát).
                     try {
-                        latch.await(30, TimeUnit.SECONDS)
-                    } catch (ie: InterruptedException) {
-                        Thread.currentThread().interrupt()
+                        val progress = JSObject()
+                        progress.put("index", sentenceIndex)
+                        notifyListeners("speakProgress", progress)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Không gửi được sự kiện speakProgress: ${t.message}")
                     }
-                    currentLatch = null
-                    if (speakCancelled || errored) break
+
+                    val subChunks = splitIntoChunks(sentences[sentenceIndex], SAFE_CHUNK_LEN)
+                    if (subChunks.isEmpty()) continue
+
+                    for ((subIdx, chunkText) in subChunks.withIndex()) {
+                        if (speakCancelled) break@outer
+                        val utteranceId = "speak_${sentenceIndex}_$subIdx"
+                        val latch = CountDownLatch(1)
+                        currentLatch = latch
+                        var errored = false
+
+                        val listener = object : UtteranceProgressListener() {
+                            override fun onStart(id: String?) {}
+                            override fun onDone(id: String?) {
+                                if (id == utteranceId) latch.countDown()
+                            }
+                            @Deprecated("Deprecated in Java")
+                            override fun onError(id: String?) {
+                                if (id == utteranceId) { errored = true; latch.countDown() }
+                            }
+                            override fun onError(id: String?, errorCode: Int) {
+                                if (id == utteranceId) { errored = true; latch.countDown() }
+                            }
+                        }
+                        engine.setOnUtteranceProgressListener(listener)
+
+                        val params = Bundle()
+                        // QUEUE_ADD luôn luôn: cả sub-chunk trong cùng câu lẫn câu
+                        // kế tiếp đều được nối liền vào hàng đợi CÙNG một engine,
+                        // KHÔNG hề rời khỏi vòng lặp Kotlin này -> không có
+                        // khoảng trống chờ bridge như kiến trúc cũ.
+                        val result = try {
+                            engine.speak(chunkText, TextToSpeech.QUEUE_ADD, params, utteranceId)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "speak() ném lỗi ở câu $sentenceIndex, đoạn $subIdx: ${t.message}", t)
+                            TextToSpeech.ERROR
+                        }
+                        if (result != TextToSpeech.SUCCESS) {
+                            errored = true
+                            latch.countDown()
+                        }
+
+                        try {
+                            latch.await(30, TimeUnit.SECONDS)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        }
+                        currentLatch = null
+                        if (speakCancelled || errored) break@outer
+                    }
                 }
+
+                val finishedNaturally = !speakCancelled && lastIndexReached >= sentences.size - 1
+                try {
+                    val done = JSObject()
+                    done.put("cancelled", speakCancelled)
+                    done.put("lastIndex", lastIndexReached)
+                    done.put("finished", finishedNaturally)
+                    notifyListeners("speakDone", done)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Không gửi được sự kiện speakDone: ${t.message}")
+                }
+
                 call.resolve()
             } catch (t: Throwable) {
                 Log.e(TAG, "Lỗi khi đọc văn bản: ${t.message}", t)
