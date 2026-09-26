@@ -41,6 +41,25 @@ jobs:
         # có hiệu lực từ 31/8/2026, không cần sed riêng cho 2 giá trị này.)
         run: sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
 
+      - name: Khai báo quyền nhìn thấy TẤT CẢ bộ đọc TTS đã cài (package visibility, Android 11+)
+        # NGUYÊN NHÂN GỐC của lỗi "không lấy được hết giọng đọc đã cài trên máy":
+        # Từ Android 11 (API 30), hệ thống ẩn bớt danh sách app/dịch vụ khác với
+        # app của mình (package visibility) trừ khi app khai báo rõ mình cần
+        # thấy loại dịch vụ nào qua thẻ <queries> trong AndroidManifest.xml.
+        # TextToSpeech.getEngines() (hàm plugin đang dùng để liệt kê bộ đọc)
+        # chạy nội bộ bằng cách hỏi PackageManager tìm mọi service khai báo
+        # intent-filter "android.intent.action.TTS_SERVICE". Thiếu <queries>
+        # này, PackageManager chỉ trả về những gì "nhìn thấy mặc định" (thường
+        # chỉ có Google TTS/engine mặc định hệ thống) — các bộ đọc khác người
+        # dùng đã cài (Samsung TTS, engine hãng thứ 3, v.v.) bị ẩn đi hoàn
+        # toàn, dẫn đến app không sao lấy được voices của chúng dù đã cài.
+        # Sửa: chèn thẳng khối <queries> vào ngay sau thẻ <manifest ...> mở
+        # đầu, làm sibling của <application>, TRƯỚC khi cap sync/build.
+        run: |
+          sed -i '/<manifest /a\    <queries>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>' android/app/src/main/AndroidManifest.xml
+          echo "----- AndroidManifest.xml sau khi vá -----"
+          cat android/app/src/main/AndroidManifest.xml
+
       - name: Bật hỗ trợ biên dịch Kotlin cho project Android
         run: |
           sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20"/}' android/build.gradle
