@@ -391,7 +391,8 @@
   const CHUNK_MAX_LEN = 180;       // độ dài tối đa mỗi đoạn gửi cho TTS (an toàn cho engine Android)
   const KEEPALIVE_MS = 4000;       // chu kỳ "đánh thức" chống bug Android tự treo sau ~15s
 
-  let voicesByEngine = {};   // { engineName: [voice, voice, ...] }
+  let voicesByEngine = {};   // { engineKey: [voice, voice, ...] }
+  let nativeEngineLabels = {}; // { engineKey(package name): label hiển thị } — chỉ dùng khi ttsMode === 'native'
   let allVoices = [];
   let isSpeaking = false;    // đang thực sự phát âm thanh (không tính lúc tạm dừng)
   let isPaused = false;      // đang ở trạng thái tạm dừng giữa chừng
@@ -571,12 +572,43 @@
     });
   }
 
-  engineSelect.addEventListener('change', () => {
-    populateVoiceSelect(engineSelect.value);
+  engineSelect.addEventListener('change', async () => {
+    const engineKey = engineSelect.value;
+    populateVoiceSelect(engineKey);
+
+    // Ở chế độ native, mỗi "bộ đọc" là 1 engine Android thật riêng biệt —
+    // phải báo cho plugin chuyển engine đang active thì speak()/lưu file
+    // mới dùng đúng giọng của bộ đọc vừa chọn (không chỉ đổi mỗi UI).
+    if (ttsMode === 'native') {
+      const plugin = getNativeTtsPlugin();
+      if (!plugin) return;
+      engineSelect.disabled = true;
+      btnSpeak.disabled = true;
+      btnReplay.disabled = true;
+      statusText.textContent = 'Đang chuyển bộ đọc...';
+      try {
+        await plugin.setEngine({ engineName: engineKey });
+        statusText.textContent = 'Sẵn sàng';
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        showToast('Không thể chuyển sang bộ đọc này: ' + msg, true);
+        statusText.textContent = 'Sẵn sàng';
+      } finally {
+        engineSelect.disabled = false;
+        btnSpeak.disabled = false;
+        btnReplay.disabled = false;
+      }
+    }
   });
 
   function getSelectedVoice() {
     const key = voiceSelect.value;
+    // Tìm trong đúng danh sách giọng của bộ đọc đang chọn trước (tránh
+    // trùng tên giữa các bộ đọc khác nhau khi ở chế độ native nhiều engine),
+    // rồi mới rơi về tìm trong toàn bộ allVoices như phương án dự phòng.
+    const inCurrentEngine = (voicesByEngine[engineSelect.value] || [])
+      .find(v => (v.voiceURI || v.name) === key);
+    if (inCurrentEngine) return inCurrentEngine;
     return allVoices.find(v => (v.voiceURI || v.name) === key) || null;
   }
 
@@ -967,10 +999,16 @@
       // để tương thích ngược với plugin cũ hơn.
     }
 
+    // Lấy TOÀN BỘ bộ đọc (engine) cài trên máy kèm TOÀN BỘ giọng đọc của
+    // từng bộ đọc — không chỉ mỗi engine mặc định của hệ thống.
     try {
-      const result = await plugin.getVoices();
-      const voices = (result && result.voices) || [];
-      if (voices.length === 0) {
+      const result = await plugin.getEnginesWithVoices();
+      const engines = (result && result.engines) || [];
+      // Chỉ giữ những bộ đọc thực sự có ít nhất 1 giọng đọc dùng được
+      // (một số engine cài trên máy nhưng chưa tải gói giọng nào).
+      const usable = engines.filter(e => Array.isArray(e.voices) && e.voices.length > 0);
+
+      if (usable.length === 0) {
         showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
         btnSpeak.disabled = true;
         btnReplay.disabled = true;
@@ -978,26 +1016,93 @@
         ttsMode = 'none';
         return;
       }
+
       ttsMode = 'native';
+      voicesByEngine = {};
+      nativeEngineLabels = {};
+      usable.forEach(e => {
+        voicesByEngine[e.name] = e.voices;
+        nativeEngineLabels[e.name] = e.label || e.name;
+      });
+      allVoices = usable.reduce((acc, e) => acc.concat(e.voices), []);
+
+      // Ưu tiên bộ đọc có giọng tiếng Việt lên đầu, giống hệt cách sắp xếp
+      // bên nhánh Web Speech API để trải nghiệm nhất quán giữa 2 chế độ.
+      const engineKeys = Object.keys(voicesByEngine).sort((a, b) => {
+        const aHasVi = voicesByEngine[a].some(isVietnameseVoice) ? 0 : 1;
+        const bHasVi = voicesByEngine[b].some(isVietnameseVoice) ? 0 : 1;
+        if (aHasVi !== bHasVi) return aHasVi - bHasVi;
+        return (nativeEngineLabels[a] || a).localeCompare(nativeEngineLabels[b] || b);
+      });
+
+      engineSelect.innerHTML = '';
+      engineKeys.forEach(key => {
+        const opt = document.createElement('option');
+        opt.value = key;
+        const voices = voicesByEngine[key];
+        const viCount = voices.filter(isVietnameseVoice).length;
+        const label = nativeEngineLabels[key] || key;
+        opt.textContent = label + (viCount > 0 ? ' 🇻🇳 (' + viCount + ' giọng Việt)' : ' (' + voices.length + ' giọng)');
+        engineSelect.appendChild(opt);
+      });
+
+      const firstEngineKey = engineKeys[0];
+      engineSelect.value = firstEngineKey;
+      populateVoiceSelect(firstEngineKey);
+
+      // Nếu bộ đọc tốt nhất (ưu tiên tiếng Việt) không trùng engine mặc định
+      // hệ thống đang dùng, chuyển plugin sang đúng engine đó ngay từ đầu.
+      if (firstEngineKey && firstEngineKey !== (result.activeEngine || '')) {
+        try {
+          await plugin.setEngine({ engineName: firstEngineKey });
+        } catch (e) {
+          // Không chuyển được thì vẫn dùng engine mặc định của hệ thống —
+          // không chặn người dùng, chỉ là danh sách giọng hiển thị có thể
+          // chưa khớp 100% với giọng thực sự phát ra cho tới khi họ tự đổi
+          // bộ đọc trong dropdown.
+        }
+      }
+
       btnSpeak.disabled = false;
       btnReplay.disabled = false;
-      allVoices = voices;
-      voicesByEngine = { 'Bộ đọc hệ thống Android': voices };
-      engineSelect.innerHTML = '';
-      const opt = document.createElement('option');
-      opt.value = 'Bộ đọc hệ thống Android';
-      const viCount = voices.filter(isVietnameseVoice).length;
-      opt.textContent = 'Bộ đọc hệ thống Android' + (viCount > 0 ? ' 🇻🇳 (' + viCount + ' giọng Việt)' : ' (' + voices.length + ' giọng)');
-      engineSelect.appendChild(opt);
-      populateVoiceSelect('Bộ đọc hệ thống Android');
       statusText.textContent = 'Sẵn sàng';
     } catch (e) {
-      const msg = (e && e.message) ? e.message : String(e);
-      showToast('Không lấy được danh sách giọng đọc: ' + msg, true);
-      btnSpeak.disabled = true;
-      btnReplay.disabled = true;
-      statusText.textContent = 'Lỗi bộ đọc';
-      ttsMode = 'none';
+      // Tương thích ngược: nếu APK được build từ bản plugin cũ hơn (chưa có
+      // getEnginesWithVoices), rơi về getVoices() chỉ lấy giọng của engine
+      // mặc định — còn hơn là không đọc được gì.
+      try {
+        const result = await plugin.getVoices();
+        const voices = (result && result.voices) || [];
+        if (voices.length === 0) {
+          showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
+          btnSpeak.disabled = true;
+          btnReplay.disabled = true;
+          statusText.textContent = 'Không có giọng đọc';
+          ttsMode = 'none';
+          return;
+        }
+        ttsMode = 'native';
+        allVoices = voices;
+        voicesByEngine = { 'Bộ đọc hệ thống Android': voices };
+        nativeEngineLabels = { 'Bộ đọc hệ thống Android': 'Bộ đọc hệ thống Android' };
+        engineSelect.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = 'Bộ đọc hệ thống Android';
+        const viCount = voices.filter(isVietnameseVoice).length;
+        opt.textContent = 'Bộ đọc hệ thống Android' + (viCount > 0 ? ' 🇻🇳 (' + viCount + ' giọng Việt)' : ' (' + voices.length + ' giọng)');
+        engineSelect.appendChild(opt);
+        populateVoiceSelect('Bộ đọc hệ thống Android');
+        btnSpeak.disabled = false;
+        btnReplay.disabled = false;
+        statusText.textContent = 'Sẵn sàng';
+      } catch (e2) {
+        const msg = (e2 && e2.message) ? e2.message : String(e2);
+        showToast('Không lấy được danh sách giọng đọc: ' + msg, true);
+        btnSpeak.disabled = true;
+        btnReplay.disabled = true;
+        statusText.textContent = 'Lỗi bộ đọc';
+        ttsMode = 'none';
+      }
     }
   }
 
