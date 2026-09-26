@@ -327,8 +327,8 @@
       <span id="btnSpeakLabel">ĐỌC VĂN BẢN</span>
     </button>
     <div class="btn-row">
-      <button class="btn-sub" id="btnReplay">🔁 Nghe lại</button>
-      <button class="btn-sub danger" id="btnStop" disabled>⏹ Dừng đọc</button>
+      <button class="btn-sub" id="btnRewind">⏪ Tua lùi</button>
+      <button class="btn-sub" id="btnForward">⏩ Tua tới</button>
     </div>
     <div class="btn-row" style="grid-template-columns: 1fr;">
       <button class="btn-sub" id="btnSaveAudio">💾 Lưu âm thanh (file WAV)</button>
@@ -380,8 +380,8 @@
   const btnSpeak = document.getElementById('btnSpeak');
   const btnSpeakIcon = document.getElementById('btnSpeakIcon');
   const btnSpeakLabel = document.getElementById('btnSpeakLabel');
-  const btnReplay = document.getElementById('btnReplay');
-  const btnStop = document.getElementById('btnStop');
+  const btnRewind = document.getElementById('btnRewind');
+  const btnForward = document.getElementById('btnForward');
   const btnSaveAudio = document.getElementById('btnSaveAudio');
   const statusDot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
@@ -394,13 +394,13 @@
   let voicesByEngine = {};   // { engineKey: [voice, voice, ...] }
   let nativeEngineLabels = {}; // { engineKey(package name): label hiển thị } — chỉ dùng khi ttsMode === 'native'
   let allVoices = [];
-  let isSpeaking = false;    // đang thực sự phát âm thanh (không tính lúc tạm dừng)
-  let isPaused = false;      // đang ở trạng thái tạm dừng giữa chừng
+  let isSpeaking = false;    // đang thực sự phát âm thanh (nút chính đang ở trạng thái ⏹ Dừng)
   let toastTimer = null;
   let keepAliveTimer = null;
 
   let speechQueue = [];      // mảng các câu/đoạn cần đọc
   let queueIndex = 0;        // đoạn đang đọc / sẽ đọc tiếp
+  let lastQueueText = '';    // văn bản đã dùng để xây speechQueue lần gần nhất
   let currentSessionId = 0;  // để phân biệt phiên đọc cũ khi cancel
 
   const synthSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
@@ -584,7 +584,8 @@
       if (!plugin) return;
       engineSelect.disabled = true;
       btnSpeak.disabled = true;
-      btnReplay.disabled = true;
+      btnRewind.disabled = true;
+      btnForward.disabled = true;
       statusText.textContent = 'Đang chuyển bộ đọc...';
       try {
         await plugin.setEngine({ engineName: engineKey });
@@ -596,7 +597,8 @@
       } finally {
         engineSelect.disabled = false;
         btnSpeak.disabled = false;
-        btnReplay.disabled = false;
+        btnRewind.disabled = false;
+      btnForward.disabled = false;
       }
     }
   });
@@ -612,14 +614,20 @@
     return allVoices.find(v => (v.voiceURI || v.name) === key) || null;
   }
 
-  // ---------- Speak logic (hàng đợi từng câu) ----------
-  function setSpeakingUI(speaking, paused) {
+  // ---------- Speak logic (hàng đợi từng câu, DÙNG CHUNG cho cả web & native) ----------
+  // Nút chính (▶️/⏹) gộp Phát + Dừng làm MỘT nút duy nhất; Tua lùi/Tua tới di
+  // chuyển giữa các câu trong hàng đợi, dùng được cả lúc đang đọc lẫn lúc đã dừng.
+  function hasUnfinishedQueue() {
+    return speechQueue.length > 0 && queueIndex > 0 && queueIndex < speechQueue.length;
+  }
+
+  function setSpeakingUI(speaking) {
     isSpeaking = speaking;
-    isPaused = !!paused;
     btnSpeak.classList.toggle('speaking', speaking);
-    btnSpeakIcon.textContent = speaking ? '⏸' : '▶️';
-    btnSpeakLabel.textContent = speaking ? 'Đang đọc...' : (paused ? 'TIẾP TỤC ĐỌC' : 'ĐỌC VĂN BẢN');
-    btnStop.disabled = !speaking && !paused;
+    btnSpeakIcon.textContent = speaking ? '⏹' : '▶️';
+    btnSpeakLabel.textContent = speaking ? 'DỪNG ĐỌC' : (hasUnfinishedQueue() ? 'TIẾP TỤC ĐỌC' : 'ĐỌC VĂN BẢN');
+    btnRewind.disabled = speechQueue.length === 0;
+    btnForward.disabled = speechQueue.length === 0;
     statusDot.classList.toggle('active', speaking);
   }
 
@@ -628,8 +636,8 @@
       statusText.textContent = 'Sẵn sàng';
       return;
     }
-    const done = Math.min(queueIndex, speechQueue.length);
-    statusText.textContent = 'Đang đọc đoạn ' + done + ' / ' + speechQueue.length;
+    const shown = Math.min(queueIndex + 1, speechQueue.length);
+    statusText.textContent = (isSpeaking ? 'Đang đọc đoạn ' : 'Sẵn sàng đọc đoạn ') + shown + ' / ' + speechQueue.length;
   }
 
   function stopKeepAlive() {
@@ -652,20 +660,29 @@
     }, KEEPALIVE_MS);
   }
 
+  // Xây lại hàng đợi câu từ văn bản hiện tại — CHỈ gọi khi bắt đầu đọc mới
+  // hoàn toàn (không gọi lúc tiếp tục/tua, để không mất vị trí đang dừng dở).
+  function buildQueue(text) {
+    speechQueue = splitIntoChunks(text);
+    queueIndex = 0;
+    lastQueueText = text;
+  }
+
   function resetQueueState() {
     speechQueue = [];
     queueIndex = 0;
+    lastQueueText = '';
     stopKeepAlive();
   }
 
+  // ---------- Nhánh Web Speech API ----------
   function speakNextChunk(sessionId) {
-    // Nếu phiên đọc này đã bị hủy bởi một lệnh mới hơn thì dừng lại
+    // Nếu phiên đọc này đã bị hủy bởi một lệnh mới hơn (Dừng/Tua) thì thôi
     if (sessionId !== currentSessionId) return;
 
     if (queueIndex >= speechQueue.length) {
-      // Đọc xong toàn bộ
       stopKeepAlive();
-      setSpeakingUI(false, false);
+      setSpeakingUI(false);
       statusText.textContent = 'Đã đọc xong';
       return;
     }
@@ -684,7 +701,7 @@
 
     utterance.onstart = () => {
       if (sessionId !== currentSessionId) return;
-      setSpeakingUI(true, false);
+      setSpeakingUI(true);
       updateProgressStatus();
     };
 
@@ -698,14 +715,89 @@
       if (sessionId !== currentSessionId) return;
       if (e.error === 'canceled' || e.error === 'interrupted') return;
       stopKeepAlive();
-      setSpeakingUI(false, false);
+      setSpeakingUI(false);
       showToast('Đã xảy ra lỗi khi đọc văn bản: ' + e.error, true);
     };
 
     window.speechSynthesis.speak(utterance);
   }
 
-  // ---------- Đọc bằng plugin native (dùng khi WebView không hỗ trợ Web Speech API) ----------
+  function startSpeakingWeb(text) {
+    if (!synthSupported) {
+      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
+      return;
+    }
+    if (!text || !text.trim()) {
+      showToast('Vui lòng nhập văn bản trước khi đọc.', true);
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    currentSessionId += 1;
+    const sessionId = currentSessionId;
+
+    buildQueue(text);
+    if (speechQueue.length === 0) {
+      showToast('Vui lòng nhập văn bản trước khi đọc.', true);
+      return;
+    }
+
+    startKeepAlive();
+    speakNextChunk(sessionId);
+  }
+
+  // ---------- Nhánh plugin native (đọc TỪNG CÂU một, cho phép tua lùi/tua tới) ----------
+  // KHÁC với bản cũ (gửi nguyên văn bản cho plugin trong 1 lần gọi): giờ JS tự
+  // tách câu bằng splitIntoChunks() y hệt nhánh web, rồi gọi plugin.speak()
+  // tuần tự từng câu — nhờ vậy mới biết chính xác "đang ở câu nào" để Tua
+  // lùi/Tua tới hoạt động nhất quán giữa 2 chế độ.
+  async function speakNextChunkNative(sessionId) {
+    if (sessionId !== currentSessionId) return;
+
+    if (queueIndex >= speechQueue.length) {
+      setSpeakingUI(false);
+      statusText.textContent = 'Đã đọc xong';
+      return;
+    }
+
+    const plugin = getNativeTtsPlugin();
+    if (!plugin) {
+      setSpeakingUI(false);
+      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
+      return;
+    }
+
+    const chunk = speechQueue[queueIndex];
+    const voice = getSelectedVoice();
+    setSpeakingUI(true);
+    updateProgressStatus();
+
+    try {
+      await plugin.speak({
+        text: chunk,
+        voiceName: voice ? voice.name : '',
+        lang: voice ? voice.lang : 'vi-VN',
+        rate: parseFloat(rateSelect.value),
+        pitch: parseFloat(pitchSelect.value)
+      });
+    } catch (err) {
+      if (sessionId !== currentSessionId) return; // bị hủy do bấm Dừng/Tua giữa chừng
+      const msg = (err && err.message) ? err.message : String(err);
+      showToast('Lỗi khi đọc văn bản: ' + msg, true);
+      setSpeakingUI(false);
+      return;
+    }
+
+    // QUAN TRỌNG: plugin.speak() ở phía Kotlin LUÔN resolve() (không reject)
+    // kể cả khi bị stopSpeaking() hủy giữa chừng (xem doSynthesizeToFile/speak
+    // trong TtsFileSaverPlugin.kt) -> bắt buộc phải tự kiểm tra sessionId ở
+    // đây, nếu không đoạn vừa bị Dừng/Tua sẽ vẫn tưởng đọc xong rồi tự nhảy
+    // sang đọc tiếp đoạn kế, y hệt lỗi đã từng gặp ở nhánh web trước đây.
+    if (sessionId !== currentSessionId) return;
+    queueIndex += 1;
+    speakNextChunkNative(sessionId);
+  }
+
   async function startSpeakingNative(text) {
     const plugin = getNativeTtsPlugin();
     if (!plugin) {
@@ -727,129 +819,100 @@
       // Plugin cũ không có getEngineStatus: bỏ qua, để speak() tự báo lỗi.
     }
 
-    const voice = getSelectedVoice();
-
-    btnSpeak.disabled = true;
-    btnSpeak.classList.add('speaking');
-    btnSpeakIcon.textContent = '⏸';
-    btnSpeakLabel.textContent = 'Đang đọc...';
-    btnStop.disabled = false;
-    statusDot.classList.add('active');
-    statusText.textContent = 'Đang phát âm thanh...';
-
-    try {
-      await plugin.speak({
-        text: text,
-        voiceName: voice ? voice.name : '',
-        lang: voice ? voice.lang : 'vi-VN',
-        rate: parseFloat(rateSelect.value),
-        pitch: parseFloat(pitchSelect.value)
-      });
-      statusText.textContent = 'Đã đọc xong';
-    } catch (err) {
-      const msg = (err && err.message) ? err.message : String(err);
-      showToast('Lỗi khi đọc văn bản: ' + msg, true);
-      statusText.textContent = 'Sẵn sàng';
-    } finally {
-      btnSpeak.disabled = false;
-      btnSpeak.classList.remove('speaking');
-      btnSpeakIcon.textContent = '▶️';
-      btnSpeakLabel.textContent = 'ĐỌC VĂN BẢN';
-      btnStop.disabled = true;
-      statusDot.classList.remove('active');
-    }
-  }
-
-  function startSpeaking(text) {
-    if (!synthSupported) {
-      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
-      return;
-    }
-    if (!text || !text.trim()) {
-      showToast('Vui lòng nhập văn bản trước khi đọc.', true);
-      return;
-    }
-
-    window.speechSynthesis.cancel();
-    currentSessionId += 1;
-    const sessionId = currentSessionId;
-
-    speechQueue = splitIntoChunks(text);
-    queueIndex = 0;
-
+    buildQueue(text);
     if (speechQueue.length === 0) {
       showToast('Vui lòng nhập văn bản trước khi đọc.', true);
       return;
     }
 
-    startKeepAlive();
-    speakNextChunk(sessionId);
+    currentSessionId += 1;
+    const sessionId = currentSessionId;
+    speakNextChunkNative(sessionId);
   }
 
-  btnSpeak.addEventListener('click', () => {
+  // Dừng HẲN đoạn đang đọc dở (không phải "tạm dừng" nữa — khái niệm pause
+  // riêng đã được thay bằng Dừng + Tua lùi/Tua tới). Dùng chung cho cả nút
+  // Dừng (đã gộp vào btnSpeak) lẫn lúc Tua cần ngắt đoạn đang đọc trước khi
+  // nhảy sang câu khác.
+  async function stopCurrentSpeech() {
+    currentSessionId += 1; // vô hiệu hóa mọi callback/await đang chờ của đoạn cũ
+    stopKeepAlive();
     if (ttsMode === 'native') {
-      startSpeakingNative(textInput.value);
-      return;
+      const plugin = getNativeTtsPlugin();
+      if (plugin) {
+        try { await plugin.stopSpeaking(); } catch (e) { /* không quan trọng, bỏ qua */ }
+      }
+    } else if (ttsMode === 'web') {
+      window.speechSynthesis.cancel();
     }
-    if (ttsMode !== 'web') {
+  }
+
+  btnSpeak.addEventListener('click', async () => {
+    if (ttsMode !== 'native' && ttsMode !== 'web') {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       return;
     }
 
     if (isSpeaking) {
-      // Đang đọc -> tạm dừng: hủy đoạn hiện tại, giữ nguyên vị trí queueIndex
-      // (không dùng speechSynthesis.pause() vì kém tin cậy trên nhiều máy Android).
-      // QUAN TRỌNG: phải tăng currentSessionId TRƯỚC khi cancel() để vô hiệu hóa
-      // callback (onend/onerror) của utterance vừa bị hủy — một số WebView Android
-      // bắn 'onend' thay vì 'onerror' khi cancel(), nếu không tăng session thì code
-      // sẽ tưởng đoạn đó đọc xong và tự đọc tiếp, phá luôn tính năng tạm dừng.
-      currentSessionId += 1;
-      stopKeepAlive();
-      window.speechSynthesis.cancel();
-      setSpeakingUI(false, true);
-      statusText.textContent = 'Đã tạm dừng (đoạn ' + (queueIndex + 1) + ' / ' + speechQueue.length + ')';
+      // Đang đọc -> bấm để DỪNG HẲN. Vẫn giữ nguyên queueIndex để có thể
+      // Tua lùi/Tua tới hoặc bấm lại nút này để đọc tiếp đúng từ câu đang dừng.
+      await stopCurrentSpeech();
+      setSpeakingUI(false);
+      statusText.textContent = 'Đã dừng (đoạn ' + (queueIndex + 1) + ' / ' + speechQueue.length + ')';
       return;
     }
 
-    if (isPaused && speechQueue.length > 0 && queueIndex < speechQueue.length) {
-      // Tiếp tục đọc từ đoạn đang dang dở
-      currentSessionId += 1;
-      const sessionId = currentSessionId;
+    const text = textInput.value;
+    // Hàng đợi rỗng, đã đọc hết toàn bộ, hoặc văn bản đã bị sửa từ lúc dừng
+    // -> coi như đọc mới hoàn toàn từ đầu.
+    if (speechQueue.length === 0 || queueIndex >= speechQueue.length || text !== lastQueueText) {
+      if (ttsMode === 'native') {
+        await startSpeakingNative(text);
+      } else {
+        startSpeakingWeb(text);
+      }
+      return;
+    }
+
+    // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
+    // từ câu đang dừng, KHÔNG đọc lại từ đầu.
+    currentSessionId += 1;
+    const sessionId = currentSessionId;
+    if (ttsMode === 'native') {
+      speakNextChunkNative(sessionId);
+    } else {
       startKeepAlive();
       speakNextChunk(sessionId);
-      return;
     }
-
-    startSpeaking(textInput.value);
   });
 
-  btnReplay.addEventListener('click', () => {
-    const text = textInput.value;
-    if (!text || !text.trim()) {
-      showToast('Vui lòng nhập văn bản trước khi nghe lại.', true);
+  // ---------- Tua lùi / Tua tới: nhảy giữa các câu trong hàng đợi ----------
+  async function seek(delta) {
+    if (speechQueue.length === 0) {
+      showToast('Chưa có nội dung đang đọc để tua.', true);
       return;
     }
-    if (ttsMode === 'native') {
-      startSpeakingNative(text);
-      return;
-    }
-    startSpeaking(text);
-  });
+    const wasSpeaking = isSpeaking;
+    await stopCurrentSpeech(); // đã tự tăng currentSessionId ở bên trong
+    queueIndex = Math.min(Math.max(queueIndex + delta, 0), speechQueue.length - 1);
 
-  btnStop.addEventListener('click', () => {
-    if (ttsMode === 'native') {
-      const plugin = getNativeTtsPlugin();
-      if (plugin) plugin.stopSpeaking().catch(() => {});
-      statusText.textContent = 'Đã dừng';
-      return;
+    if (wasSpeaking) {
+      const sessionId = currentSessionId; // dùng lại id vừa tăng trong stopCurrentSpeech()
+      if (ttsMode === 'native') {
+        speakNextChunkNative(sessionId);
+      } else {
+        startKeepAlive();
+        speakNextChunk(sessionId);
+      }
+    } else {
+      setSpeakingUI(false);
+      updateProgressStatus();
     }
-    if (ttsMode !== 'web') return;
-    currentSessionId += 1; // vô hiệu hóa mọi callback đang chờ
-    window.speechSynthesis.cancel();
-    resetQueueState();
-    setSpeakingUI(false, false);
-    statusText.textContent = 'Đã dừng';
-  });
+  }
+
+  btnRewind.addEventListener('click', () => { seek(-1); });
+  btnForward.addEventListener('click', () => { seek(1); });
+
 
   // Nếu người dùng chuyển ứng dụng / tắt màn hình, khi quay lại kiểm tra và
   // đồng bộ lại UI cho khớp trạng thái thực tế của engine (tránh kẹt UI).
@@ -858,7 +921,7 @@
     if (document.visibilityState === 'visible') {
       if (!window.speechSynthesis.speaking && isSpeaking) {
         stopKeepAlive();
-        setSpeakingUI(false, isPaused);
+        setSpeakingUI(false);
       }
     }
   });
@@ -976,7 +1039,8 @@
     if (!plugin) {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       btnSpeak.disabled = true;
-      btnReplay.disabled = true;
+      btnRewind.disabled = true;
+      btnForward.disabled = true;
       statusText.textContent = 'Không hỗ trợ đọc giọng nói';
       ttsMode = 'none';
       return;
@@ -989,7 +1053,8 @@
       if (engineStatus && engineStatus.status === 'error') {
         showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
         btnSpeak.disabled = true;
-        btnReplay.disabled = true;
+        btnRewind.disabled = true;
+      btnForward.disabled = true;
         statusText.textContent = 'Không có bộ đọc khả dụng';
         ttsMode = 'none';
         return;
@@ -1011,7 +1076,8 @@
       if (usable.length === 0) {
         showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
         btnSpeak.disabled = true;
-        btnReplay.disabled = true;
+        btnRewind.disabled = true;
+      btnForward.disabled = true;
         statusText.textContent = 'Không có giọng đọc';
         ttsMode = 'none';
         return;
@@ -1064,7 +1130,8 @@
       }
 
       btnSpeak.disabled = false;
-      btnReplay.disabled = false;
+      btnRewind.disabled = false;
+      btnForward.disabled = false;
       statusText.textContent = 'Sẵn sàng';
     } catch (e) {
       // Tương thích ngược: nếu APK được build từ bản plugin cũ hơn (chưa có
@@ -1076,7 +1143,8 @@
         if (voices.length === 0) {
           showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
           btnSpeak.disabled = true;
-          btnReplay.disabled = true;
+          btnRewind.disabled = true;
+      btnForward.disabled = true;
           statusText.textContent = 'Không có giọng đọc';
           ttsMode = 'none';
           return;
@@ -1093,13 +1161,15 @@
         engineSelect.appendChild(opt);
         populateVoiceSelect('Bộ đọc hệ thống Android');
         btnSpeak.disabled = false;
-        btnReplay.disabled = false;
+        btnRewind.disabled = false;
+      btnForward.disabled = false;
         statusText.textContent = 'Sẵn sàng';
       } catch (e2) {
         const msg = (e2 && e2.message) ? e2.message : String(e2);
         showToast('Không lấy được danh sách giọng đọc: ' + msg, true);
         btnSpeak.disabled = true;
-        btnReplay.disabled = true;
+        btnRewind.disabled = true;
+      btnForward.disabled = true;
         statusText.textContent = 'Lỗi bộ đọc';
         ttsMode = 'none';
       }
