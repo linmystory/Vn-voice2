@@ -1,5 +1,15 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
+> **Cập nhật v2.2 — nâng cấp lên Capacitor 8 (công nghệ mới nhất hiện tại):**
+> - Nâng `@capacitor/core`, `@capacitor/android`, `@capacitor/cli` từ `6.1.2` (đã cũ 2 major version) lên **`8.5.2`/`8.5.1`** — bản ổn định mới nhất tại thời điểm cập nhật.
+> - **Lý do bắt buộc:** từ 31/8/2026, Google Play yêu cầu mọi app mới/bản cập nhật phải target Android 16 (API 36). Capacitor 6 mặc định chỉ target API 34 → sẽ bị Google Play từ chối. Capacitor 8 mặc định target đúng API 36, không cần vá thêm.
+> - Nâng Kotlin `1.9.24` → `2.2.20`, JDK `17` → `21`, Node.js `20` → `22` trong CI, đúng theo yêu cầu chính thức của Capacitor 8.
+> - **Lưu ý rủi ro đã biết (chưa build thử được do sandbox không có mạng):** Capacitor 8.5.x mặc định dùng AGP 8.13.0, hiện có 1 issue đang mở trên GitHub của Capacitor về việc Android Studio cảnh báo AGP 8.13.0 chưa được hỗ trợ chính thức (ionic-team/capacitor#8292) — cảnh báo này chủ yếu ảnh hưởng khi mở project bằng Android Studio GUI, không chắc có chặn build dòng lệnh `./gradlew assembleDebug` trong CI hay không. Một issue khác (#8355) về lỗi ProGuard chỉ ảnh hưởng project có dùng `@capacitor/haptics`/`@capacitor/keyboard` — project này không dùng 2 plugin đó nên không bị ảnh hưởng. Nếu CI build lỗi sau khi cập nhật, khả năng cao là do issue #8292 — cân nhắc pin tạm AGP về `8.12.2` trong `android/build.gradle` như một phương án dự phòng.
+
+> **Cập nhật v2.1:**
+> - Bổ sung `getEnginesWithVoices()` trong plugin native: lấy **toàn bộ bộ đọc (TTS engine)** cài trên máy (Google TTS, Samsung TTS, v.v.) kèm **toàn bộ giọng đọc trong từng bộ đọc** — trước đây chỉ lấy giọng của engine mặc định. Dropdown "Bộ đọc" ở chế độ native giờ liệt kê đầy đủ như chế độ Web Speech API.
+> - Bổ sung `setEngine()`: khi người dùng đổi bộ đọc trong dropdown, app chuyển đúng engine Android thật sự dùng để đọc/lưu file, không chỉ đổi giao diện.
+
 > **Lưu ý phạm vi:** bản này CHỈ HỖ TRỢ ANDROID 10 (API 29) TRỞ LÊN.
 > Toàn bộ code xử lý quyền lưu trữ runtime kiểu cũ (`WRITE_EXTERNAL_STORAGE`)
 > và khai báo `FileProvider` cho Android 9 trở xuống đã được **loại bỏ** để
