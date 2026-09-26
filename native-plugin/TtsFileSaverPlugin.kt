@@ -81,6 +81,10 @@ class TtsFileSaverPlugin : Plugin() {
 
     private var tts: TextToSpeech? = null
 
+    // Package name của engine TTS đang active (dùng cho speak()/synthesizeToFile()).
+    // null nghĩa là đang dùng engine mặc định của hệ thống.
+    @Volatile private var activeEngineName: String? = null
+
     @Volatile private var engineStatus: String = STATUS_LOADING
 
     @Volatile private var engineErrorMessage: String = ""
@@ -100,6 +104,11 @@ class TtsFileSaverPlugin : Plugin() {
         try {
             tts = TextToSpeech(context) { status ->
                 if (status == TextToSpeech.SUCCESS) {
+                    // Ghi lại đúng package name của engine mặc định hệ thống đang
+                    // dùng, để lần gọi getEnginesWithVoices() đầu tiên biết chính
+                    // xác có cần chuyển engine hay không (tránh 1 lần switch thừa
+                    // không cần thiết ngay khi mở app).
+                    activeEngineName = tts?.defaultEngine
                     engineStatus = STATUS_READY
                 } else {
                     engineStatus = STATUS_ERROR
@@ -358,6 +367,145 @@ class TtsFileSaverPlugin : Plugin() {
         } catch (t: Throwable) {
             Log.e(TAG, "Lỗi khi lấy danh sách giọng đọc: ${t.message}", t)
             call.reject("Không lấy được danh sách giọng đọc: ${t.message}")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Lấy TOÀN BỘ danh sách BỘ ĐỌC (TTS engine) cài trên máy — ví dụ Google
+    // Text-to-speech, Samsung TTS, v.v. — kèm theo TOÀN BỘ GIỌNG ĐỌC có
+    // trong TỪNG bộ đọc đó (không chỉ giọng của engine mặc định).
+    //
+    // Android không cho lấy voices() của 1 engine không active chỉ bằng 1
+    // instance TextToSpeech. Vì vậy với mỗi engine liệt kê được, ta phải
+    // khởi tạo TẠM 1 instance TextToSpeech riêng trỏ đúng gói (package) của
+    // engine đó, đợi init xong, đọc voices(), rồi shutdown() ngay để không
+    // giữ tài nguyên/rò rỉ. Việc này chạy tuần tự trên executor riêng (không
+    // phải luồng chính) vì có thể mất vài giây nếu máy cài nhiều bộ đọc.
+    // ------------------------------------------------------------------
+    @PluginMethod
+    fun getEnginesWithVoices(call: PluginCall) {
+        if (!ensureReadyOrReject(call)) return
+        runOnExecutor(call) {
+            val defaultEngine = tts
+            if (defaultEngine == null) {
+                call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                return@runOnExecutor
+            }
+            try {
+                val engineInfos = try {
+                    defaultEngine.engines ?: emptyList()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Không lấy được danh sách bộ đọc: ${t.message}")
+                    emptyList()
+                }
+
+                val resultArr = JSArray()
+                for (info in engineInfos) {
+                    val voicesArr = JSArray()
+                    var tempTts: TextToSpeech? = null
+                    try {
+                        val latch = CountDownLatch(1)
+                        var initOk = false
+                        try {
+                            tempTts = TextToSpeech(context, { status ->
+                                initOk = (status == TextToSpeech.SUCCESS)
+                                latch.countDown()
+                            }, info.name)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Không khởi tạo được bộ đọc tạm '${info.name}': ${t.message}")
+                            latch.countDown()
+                        }
+                        // Chờ tối đa 5 giây cho MỖI engine — tránh 1 engine lỗi/chậm
+                        // làm treo toàn bộ danh sách.
+                        try {
+                            latch.await(5, TimeUnit.SECONDS)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        }
+                        if (initOk) {
+                            try {
+                                tempTts?.voices?.forEach { v ->
+                                    val vObj = JSObject()
+                                    vObj.put("name", v.name)
+                                    vObj.put("lang", v.locale.toLanguageTag())
+                                    voicesArr.put(vObj)
+                                }
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "Không lấy được voices của bộ đọc '${info.name}': ${t.message}")
+                            }
+                        }
+                    } finally {
+                        // Luôn shutdown instance tạm, kể cả khi init lỗi/timeout,
+                        // để không giữ tài nguyên hệ thống.
+                        try { tempTts?.stop() } catch (_: Throwable) {}
+                        try { tempTts?.shutdown() } catch (_: Throwable) {}
+                    }
+
+                    val engObj = JSObject()
+                    engObj.put("name", info.name)
+                    engObj.put("label", info.label ?: info.name)
+                    engObj.put("voices", voicesArr)
+                    resultArr.put(engObj)
+                }
+
+                val ret = JSObject()
+                ret.put("engines", resultArr)
+                ret.put("activeEngine", activeEngineName ?: "")
+                call.resolve(ret)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Lỗi khi lấy danh sách bộ đọc/giọng đọc: ${t.message}", t)
+                call.reject("Không lấy được danh sách bộ đọc: ${t.message}")
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Chuyển bộ đọc (engine) đang dùng cho speak()/synthesizeToFile() sang
+    // đúng bộ đọc mà người dùng chọn trong dropdown. Tắt engine cũ, khởi
+    // tạo engine mới, CHỜ tới khi engine mới init xong rồi mới trả kết quả
+    // cho JS — tránh trường hợp người dùng bấm "Đọc" ngay sau khi vừa đổi
+    // bộ đọc mà engine mới chưa kịp sẵn sàng.
+    // engineName rỗng ("") = quay lại engine mặc định của hệ thống.
+    // ------------------------------------------------------------------
+    @PluginMethod
+    fun setEngine(call: PluginCall) {
+        val engineName = call.getString("engineName") ?: ""
+        runOnExecutor(call) {
+            val oldTts = tts
+            try {
+                val latch = CountDownLatch(1)
+                var initStatus = TextToSpeech.ERROR
+                val newTts = if (engineName.isBlank()) {
+                    TextToSpeech(context) { status -> initStatus = status; latch.countDown() }
+                } else {
+                    TextToSpeech(context, { status -> initStatus = status; latch.countDown() }, engineName)
+                }
+                val finished = try {
+                    latch.await(10, TimeUnit.SECONDS)
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                }
+                if (!finished || initStatus != TextToSpeech.SUCCESS) {
+                    try { newTts.shutdown() } catch (_: Throwable) {}
+                    call.reject("Không thể chuyển sang bộ đọc đã chọn (mã lỗi $initStatus).")
+                    return@runOnExecutor
+                }
+
+                // Chỉ thay tham chiếu 'tts' SAU KHI engine mới đã sẵn sàng, để
+                // các lệnh speak()/synthesizeToFile() đang chờ trong executor
+                // (chạy tuần tự, cùng 1 luồng) luôn thấy engine hợp lệ.
+                tts = newTts
+                activeEngineName = engineName.ifBlank { null }
+
+                try { oldTts?.stop() } catch (_: Throwable) {}
+                try { oldTts?.shutdown() } catch (_: Throwable) {}
+
+                call.resolve()
+            } catch (t: Throwable) {
+                Log.e(TAG, "Lỗi khi chuyển bộ đọc: ${t.message}", t)
+                call.reject("Lỗi khi chuyển bộ đọc: ${t.message}")
+            }
         }
     }
 
