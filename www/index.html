@@ -582,6 +582,18 @@
     if (ttsMode === 'native') {
       const plugin = getNativeTtsPlugin();
       if (!plugin) return;
+
+      // QUAN TRỌNG: setEngine() và speak() dùng CHUNG 1 luồng xử lý phía
+      // Kotlin (để tránh 2 engine cùng phát ra loa một lúc / xung đột thiết
+      // bị đầu ra) -> nếu đang đọc dở mà không dừng trước, lệnh đổi engine
+      // sẽ bị XẾP HÀNG chờ đọc xong TOÀN BỘ văn bản mới thật sự chạy, khiến
+      // người dùng tưởng app bị treo/lag. Phải dừng đọc trước khi đổi.
+      if (isSpeaking) {
+        await stopCurrentSpeech();
+        setSpeakingUI(false);
+        updateProgressStatus();
+      }
+
       engineSelect.disabled = true;
       btnSpeak.disabled = true;
       btnRewind.disabled = true;
@@ -746,64 +758,73 @@
     speakNextChunk(sessionId);
   }
 
-  // ---------- Nhánh plugin native (đọc TỪNG CÂU một, cho phép tua lùi/tua tới) ----------
-  // KHÁC với bản cũ (gửi nguyên văn bản cho plugin trong 1 lần gọi): giờ JS tự
-  // tách câu bằng splitIntoChunks() y hệt nhánh web, rồi gọi plugin.speak()
-  // tuần tự từng câu — nhờ vậy mới biết chính xác "đang ở câu nào" để Tua
-  // lùi/Tua tới hoạt động nhất quán giữa 2 chế độ.
-  async function speakNextChunkNative(sessionId, warmup) {
-    if (sessionId !== currentSessionId) return;
+  // ---------- Nhánh plugin native ----------
+  // QUAN TRỌNG: gửi TOÀN BỘ mảng câu còn lại cho plugin trong DUY NHẤT 1 lệnh
+  // gọi (plugin.speak({chunks, startIndex, ...})), để Kotlin đọc liên tục
+  // không rời vòng lặp. TUYỆT ĐỐI không gọi speak() riêng cho từng câu rồi
+  // chờ JS gọi lại — cách đó tạo ra khoảng trống "round-trip" giữa 2 câu
+  // (JS chờ Promise trả về rồi mới gọi câu tiếp), khiến hàng đợi âm thanh
+  // của engine bị rỗng giữa chừng, audio route phải khởi động lại như câu
+  // đầu -> gây mất tiếng đầu + khựng LẶP LẠI ở mọi câu (lỗi đã gặp phải).
+  // Tua lùi/Tua tới vẫn hoạt động nhờ lắng nghe sự kiện 'speakProgress' để
+  // biết chính xác plugin đang đọc tới câu nào, mà không cần tự gọi lại.
+  let nativeListenersReady = false;
+  function setupNativeListeners() {
+    if (nativeListenersReady) return;
+    const plugin = getNativeTtsPlugin();
+    if (!plugin || typeof plugin.addListener !== 'function') return;
+    nativeListenersReady = true;
+    plugin.addListener('speakProgress', (data) => {
+      if (data && typeof data.index === 'number') {
+        queueIndex = data.index;
+        updateProgressStatus();
+      }
+    });
+  }
 
-    if (queueIndex >= speechQueue.length) {
-      setSpeakingUI(false);
-      statusText.textContent = 'Đã đọc xong';
-      return;
-    }
-
+  async function runNativeSpeech(startIndex, warmup) {
     const plugin = getNativeTtsPlugin();
     if (!plugin) {
       setSpeakingUI(false);
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       return;
     }
+    setupNativeListeners();
 
-    const chunk = speechQueue[queueIndex];
+    currentSessionId += 1;
+    const sessionId = currentSessionId;
     const voice = getSelectedVoice();
+
     setSpeakingUI(true);
+    queueIndex = startIndex;
     updateProgressStatus();
 
     try {
+      // 1 LỆNH GỌI DUY NHẤT cho toàn bộ phần còn lại — xem giải thích ở trên.
       await plugin.speak({
-        text: chunk,
+        chunks: speechQueue,
+        startIndex: startIndex,
         voiceName: voice ? voice.name : '',
         lang: voice ? voice.lang : 'vi-VN',
         rate: parseFloat(rateSelect.value),
         pitch: parseFloat(pitchSelect.value),
-        // true CHỈ ở câu đầu tiên của phiên đọc (mới Phát/Tiếp tục/Tua) để
-        // plugin xin AudioFocus + làm nóng đúng 1 lần; các câu tiếp theo
-        // trong CÙNG phiên phát liên tục truyền false — nếu không, mỗi câu
-        // đều bị chèn thêm khoảng lặng + xin/nhả AudioFocus, gây khựng/ngắt
-        // giữa các câu (đúng là lỗi đang gặp phải).
         warmup: !!warmup
       });
     } catch (err) {
-      if (sessionId !== currentSessionId) return; // bị hủy do bấm Dừng/Tua giữa chừng
+      if (sessionId !== currentSessionId) return; // bị hủy do Dừng/Tua giữa chừng
       const msg = (err && err.message) ? err.message : String(err);
       showToast('Lỗi khi đọc văn bản: ' + msg, true);
       setSpeakingUI(false);
       return;
     }
 
-    // QUAN TRỌNG: plugin.speak() ở phía Kotlin LUÔN resolve() (không reject)
-    // kể cả khi bị stopSpeaking() hủy giữa chừng (xem doSynthesizeToFile/speak
-    // trong TtsFileSaverPlugin.kt) -> bắt buộc phải tự kiểm tra sessionId ở
-    // đây, nếu không đoạn vừa bị Dừng/Tua sẽ vẫn tưởng đọc xong rồi tự nhảy
-    // sang đọc tiếp đoạn kế, y hệt lỗi đã từng gặp ở nhánh web trước đây.
+    // plugin.speak() chỉ thật sự "resolve xong" khi TOÀN BỘ câu đã đọc hết
+    // hoặc bị stopSpeaking() hủy giữa chừng. Nếu đã bị một lệnh mới hơn
+    // (Dừng/Tua) vô hiệu hóa session này thì bỏ qua, phần code xử lý
+    // Dừng/Tua đã tự cập nhật UI của riêng nó rồi.
     if (sessionId !== currentSessionId) return;
-    queueIndex += 1;
-    // Gọi tiếp không truyền warmup (mặc định false/undefined) -> câu kế nối
-    // liền ngay, không lặp lại bước làm nóng vì engine vẫn đang "nóng máy".
-    speakNextChunkNative(sessionId);
+    setSpeakingUI(false);
+    statusText.textContent = 'Đã đọc xong';
   }
 
   async function startSpeakingNative(text) {
@@ -833,9 +854,7 @@
       return;
     }
 
-    currentSessionId += 1;
-    const sessionId = currentSessionId;
-    speakNextChunkNative(sessionId, true);
+    runNativeSpeech(0, true);
   }
 
   // Dừng HẲN đoạn đang đọc dở (không phải "tạm dừng" nữa — khái niệm pause
@@ -884,11 +903,11 @@
 
     // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
     // từ câu đang dừng, KHÔNG đọc lại từ đầu.
-    currentSessionId += 1;
-    const sessionId = currentSessionId;
     if (ttsMode === 'native') {
-      speakNextChunkNative(sessionId, true);
+      runNativeSpeech(queueIndex, true);
     } else {
+      currentSessionId += 1;
+      const sessionId = currentSessionId;
       startKeepAlive();
       speakNextChunk(sessionId);
     }
@@ -905,10 +924,10 @@
     queueIndex = Math.min(Math.max(queueIndex + delta, 0), speechQueue.length - 1);
 
     if (wasSpeaking) {
-      const sessionId = currentSessionId; // dùng lại id vừa tăng trong stopCurrentSpeech()
       if (ttsMode === 'native') {
-        speakNextChunkNative(sessionId, true);
+        runNativeSpeech(queueIndex, true);
       } else {
+        const sessionId = currentSessionId; // dùng lại id vừa tăng trong stopCurrentSpeech()
         startKeepAlive();
         speakNextChunk(sessionId);
       }
