@@ -236,6 +236,43 @@ class TtsFileSaverPlugin : Plugin() {
                 }
                 tmpDir = workDir
 
+                // "Làm nóng" bộ máy tổng hợp giọng nói TRƯỚC khi ghi đoạn thật.
+                // Nguyên nhân mất đoạn đầu trong file WAV: nhiều engine TTS
+                // (đặc biệt Google TTS) cần thời gian khởi động backend tổng
+                // hợp ở lần synthesizeToFile() đầu tiên sau khi đổi giọng/
+                // ngôn ngữ hoặc sau một thời gian không dùng -> vài trăm ms
+                // âm thanh đầu tiên bị thiếu hoặc nhiễu trong file xuất ra.
+                // Khắc phục: tổng hợp trước một ký tự vô nghĩa ra file tạm
+                // rồi xoá bỏ ngay, coi như "mồi" cho engine chạy nóng máy;
+                // KHÔNG dùng playSilentUtterance ở đây vì nó phát ra loa
+                // thật, không phù hợp khi mục đích chỉ là xuất file.
+                val warmupFile = File(workDir, "warmup.wav")
+                val warmupUtteranceId = "warmup_${System.currentTimeMillis()}"
+                val warmupLatch = CountDownLatch(1)
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(id: String?) {}
+                    override fun onDone(id: String?) {
+                        if (id == warmupUtteranceId) warmupLatch.countDown()
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(id: String?) {
+                        if (id == warmupUtteranceId) warmupLatch.countDown()
+                    }
+                    override fun onError(id: String?, errorCode: Int) {
+                        if (id == warmupUtteranceId) warmupLatch.countDown()
+                    }
+                })
+                try {
+                    val warmupResult = engine.synthesizeToFile(".", Bundle(), warmupFile, warmupUtteranceId)
+                    if (warmupResult == TextToSpeech.SUCCESS) {
+                        warmupLatch.await(5, TimeUnit.SECONDS)
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Làm nóng engine tổng hợp thất bại (bỏ qua, không ảnh hưởng file thật): ${t.message}")
+                } finally {
+                    warmupFile.delete()
+                }
+
                 val chunkFiles = ArrayList<File>()
                 var synthesisFailed = false
                 var failMessage = ""
@@ -548,6 +585,22 @@ class TtsFileSaverPlugin : Plugin() {
                     return@runOnExecutor
                 }
 
+                // "Làm nóng" đường phát âm thanh TRƯỚC khi đọc câu thật.
+                // Nguyên nhân mất tiếng đầu: nếu loa/engine chưa phát âm thanh
+                // trong một khoảng thời gian, lệnh speak() đầu tiên phải mất
+                // thời gian xin AudioFocus + khởi tạo AudioTrack/route âm
+                // thanh -> vài trăm ms đầu của câu nói thật bị "nuốt" mất
+                // trong lúc pipeline đang khởi động.
+                // Khắc phục: phát một khoảng lặng ngắn bằng QUEUE_FLUSH trước
+                // (chính là cách Google khuyến nghị dùng playSilentUtterance)
+                // để dọn hàng đợi + khởi động pipeline; câu nói thật nối
+                // ngay sau bằng QUEUE_ADD nên không còn bị cắt đầu.
+                try {
+                    engine.playSilentUtterance(300L, TextToSpeech.QUEUE_FLUSH, null)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Không làm nóng được audio pipeline (bỏ qua, không chặn luồng đọc): ${t.message}")
+                }
+
                 for ((index, chunkText) in chunks.withIndex()) {
                     if (speakCancelled) break
                     val utteranceId = "speak_chunk_$index"
@@ -571,7 +624,10 @@ class TtsFileSaverPlugin : Plugin() {
                     engine.setOnUtteranceProgressListener(listener)
 
                     val params = Bundle()
-                    val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+                    // Luôn QUEUE_ADD: hàng đợi đã được dọn sạch bởi
+                    // playSilentUtterance(QUEUE_FLUSH) phía trên, nối thêm
+                    // câu nói thật ngay sau khoảng lặng làm nóng.
+                    val queueMode = TextToSpeech.QUEUE_ADD
                     val result = try {
                         engine.speak(chunkText, queueMode, params, utteranceId)
                     } catch (t: Throwable) {
