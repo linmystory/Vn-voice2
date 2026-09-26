@@ -41,8 +41,12 @@ package com.docdoc.app
 // Cách cài đặt: xem HUONG_DAN_CAI_DAT.md đi kèm trong dự án.
 // ============================================================================
 
+import android.content.Context
 import android.content.ContentValues
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -80,6 +84,12 @@ class TtsFileSaverPlugin : Plugin() {
     }
 
     private var tts: TextToSpeech? = null
+
+    // AudioFocusRequest đang giữ (nếu có) cho phiên đọc hiện tại. Giữ nguyên
+    // trong suốt phiên đọc (nhiều câu nối tiếp), CHỈ xin 1 LẦN lúc bắt đầu
+    // (warmup=true) và nhả ra khi dừng hẳn — xin/nhả liên tục giữa từng câu
+    // mới chính là nguyên nhân gây tiếng "khựng/ngắt" giữa các câu.
+    @Volatile private var audioFocusRequest: AudioFocusRequest? = null
 
     // Package name của engine TTS đang active (dùng cho speak()/synthesizeToFile()).
     // null nghĩa là đang dùng engine mặc định của hệ thống.
@@ -569,6 +579,13 @@ class TtsFileSaverPlugin : Plugin() {
         val lang = call.getString("lang") ?: "vi-VN"
         val rate = (call.getFloat("rate") ?: 1.0f)
         val pitch = (call.getFloat("pitch") ?: 1.0f)
+        // true = đây là câu ĐẦU TIÊN của một phiên đọc mới (mới bấm Phát/Tua/
+        // Tiếp tục) -> cần xin AudioFocus + làm nóng pipeline MỘT LẦN.
+        // false = câu nối tiếp ngay sau câu trước trong CÙNG phiên đọc ->
+        // BỎ QUA bước làm nóng, tránh khoảng lặng + xin/nhả AudioFocus liên
+        // tục giữa các câu — đây chính là nguyên nhân gây tiếng khựng/ngắt
+        // giữa chừng khi JS gọi speak() riêng cho từng câu một.
+        val warmup = call.getBoolean("warmup") ?: true
 
         runOnExecutor(call) {
             val engine = tts
@@ -585,20 +602,20 @@ class TtsFileSaverPlugin : Plugin() {
                     return@runOnExecutor
                 }
 
-                // "Làm nóng" đường phát âm thanh TRƯỚC khi đọc câu thật.
-                // Nguyên nhân mất tiếng đầu: nếu loa/engine chưa phát âm thanh
-                // trong một khoảng thời gian, lệnh speak() đầu tiên phải mất
-                // thời gian xin AudioFocus + khởi tạo AudioTrack/route âm
-                // thanh -> vài trăm ms đầu của câu nói thật bị "nuốt" mất
-                // trong lúc pipeline đang khởi động.
-                // Khắc phục: phát một khoảng lặng ngắn bằng QUEUE_FLUSH trước
-                // (chính là cách Google khuyến nghị dùng playSilentUtterance)
-                // để dọn hàng đợi + khởi động pipeline; câu nói thật nối
-                // ngay sau bằng QUEUE_ADD nên không còn bị cắt đầu.
-                try {
-                    engine.playSilentUtterance(300L, TextToSpeech.QUEUE_FLUSH, null)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Không làm nóng được audio pipeline (bỏ qua, không chặn luồng đọc): ${t.message}")
+                if (warmup) {
+                    // Xin AudioFocus TƯỜNG MINH và CHỜ xong trước khi phát bất
+                    // kỳ mẫu âm thanh nào — khắc phục gốc rễ việc mất tiếng đầu
+                    // (xem giải thích chi tiết ở hàm requestSpeechAudioFocus()).
+                    requestSpeechAudioFocus()
+                    // Phát thêm một khoảng lặng ngắn để "làm nóng" chính engine
+                    // tổng hợp giọng nói (một số engine cần vài trăm ms để
+                    // khởi động backend synthesis sau khi đổi giọng/rate/pitch
+                    // ở applyVoiceSettings() phía trên).
+                    try {
+                        engine.playSilentUtterance(300L, TextToSpeech.QUEUE_FLUSH, null)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Không làm nóng được audio pipeline (bỏ qua, không chặn luồng đọc): ${t.message}")
+                    }
                 }
 
                 for ((index, chunkText) in chunks.withIndex()) {
@@ -624,9 +641,12 @@ class TtsFileSaverPlugin : Plugin() {
                     engine.setOnUtteranceProgressListener(listener)
 
                     val params = Bundle()
-                    // Luôn QUEUE_ADD: hàng đợi đã được dọn sạch bởi
-                    // playSilentUtterance(QUEUE_FLUSH) phía trên, nối thêm
-                    // câu nói thật ngay sau khoảng lặng làm nóng.
+                    // Luôn QUEUE_ADD: nếu warmup=true thì hàng đợi vừa được dọn
+                    // sạch bởi playSilentUtterance(QUEUE_FLUSH) ở trên; nếu
+                    // warmup=false thì câu trước đó (cùng phiên đọc) đã phát
+                    // xong hẳn (đã chờ latch.await ở lần gọi speak() trước),
+                    // hàng đợi engine đang rỗng sẵn — QUEUE_ADD chỉ đơn giản là
+                    // nối câu này vào ngay, không cần flush lại.
                     val queueMode = TextToSpeech.QUEUE_ADD
                     val result = try {
                         engine.speak(chunkText, queueMode, params, utteranceId)
@@ -663,6 +683,9 @@ class TtsFileSaverPlugin : Plugin() {
             // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
             // tiếp theo (xếp hàng sau trên cùng 1 executor) phải chờ tới 30 giây.
             currentLatch?.countDown()
+            // Dừng hẳn -> nhả AudioFocus. Phiên đọc TIẾP THEO (Phát lại/Tua)
+            // sẽ tự gửi warmup=true và xin lại focus + làm nóng từ đầu.
+            abandonSpeechAudioFocus()
             call.resolve()
         } catch (t: Throwable) {
             // Dừng đọc không phải là thao tác quan trọng tới mức phải làm app
@@ -703,6 +726,52 @@ class TtsFileSaverPlugin : Plugin() {
     // Nếu ngôn ngữ yêu cầu không có sẵn trên máy, tự rơi về giọng mặc định
     // của engine thay vì im lặng đọc sai giọng (hoặc đọc lỗi) mà không báo.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Xin AudioFocus TƯỜNG MINH trước khi phát giọng nói qua loa.
+    // Lý do cần cái này: nếu để TextToSpeech tự xin AudioFocus ngầm bên
+    // trong lần speak() đầu tiên, việc xin focus + Android thật sự mở
+    // route âm thanh (audio route) diễn ra BẤT ĐỒNG BỘ và có độ trễ —
+    // trong lúc đó engine đã bắt đầu đẩy mẫu âm thanh đầu tiên vào
+    // AudioTrack, dẫn tới vài trăm ms đầu bị "rơi mất" trước khi loa kịp
+    // mở. Xin focus tường minh và CHỜ kết quả xong mới phát giúp đường
+    // audio đã sẵn sàng trước khi có bất kỳ mẫu âm nào được đẩy ra.
+    // ------------------------------------------------------------------
+    private fun requestSpeechAudioFocus() {
+        if (audioFocusRequest != null) return // đã giữ focus từ trước, khỏi xin lại
+        try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: return
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(false)
+                .build()
+            val result = audioManager.requestAudioFocus(request)
+            if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                audioFocusRequest = request
+            } else {
+                Log.w(TAG, "Xin AudioFocus không được cấp ngay (result=$result), vẫn tiếp tục đọc bình thường.")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Lỗi khi xin AudioFocus (bỏ qua, không chặn luồng đọc): ${t.message}")
+        }
+    }
+
+    private fun abandonSpeechAudioFocus() {
+        val request = audioFocusRequest ?: return
+        audioFocusRequest = null
+        try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: return
+            audioManager.abandonAudioFocusRequest(request)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Lỗi khi nhả AudioFocus (không quan trọng): ${t.message}")
+        }
+    }
+
     private fun applyVoiceSettings(engine: TextToSpeech, voiceName: String, lang: String, rate: Float, pitch: Float) {
         var chosenVoice: Voice? = null
 
@@ -1060,5 +1129,6 @@ class TtsFileSaverPlugin : Plugin() {
         try { tts?.stop() } catch (_: Throwable) {}
         try { tts?.shutdown() } catch (_: Throwable) {}
         try { executor.shutdownNow() } catch (_: Throwable) {}
+        try { abandonSpeechAudioFocus() } catch (_: Throwable) {}
     }
 }
