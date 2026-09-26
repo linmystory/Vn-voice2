@@ -49,6 +49,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -91,6 +92,12 @@ class TtsFileSaverPlugin : Plugin() {
     // mới chính là nguyên nhân gây tiếng "khựng/ngắt" giữa các câu.
     @Volatile private var audioFocusRequest: AudioFocusRequest? = null
 
+    // WakeLock giữ CPU thức trong lúc đang đọc dài. Nếu người dùng khóa màn
+    // hình/chuyển app khác giữa lúc đọc, Android có thể đưa CPU vào chế độ
+    // Doze/ngủ đông, làm luồng đọc (executor thread đang chờ latch) bị treo
+    // giữa chừng -> đúng triệu chứng "âm thanh ngắt giữa chừng" khi khóa máy.
+    @Volatile private var wakeLock: PowerManager.WakeLock? = null
+
     // Package name của engine TTS đang active (dùng cho speak()/synthesizeToFile()).
     // null nghĩa là đang dùng engine mặc định của hệ thống.
     @Volatile private var activeEngineName: String? = null
@@ -119,6 +126,7 @@ class TtsFileSaverPlugin : Plugin() {
                     // xác có cần chuyển engine hay không (tránh 1 lần switch thừa
                     // không cần thiết ngay khi mở app).
                     activeEngineName = tts?.defaultEngine
+                    tts?.let { configureEngineAudioAttributes(it) }
                     engineStatus = STATUS_READY
                 } else {
                     engineStatus = STATUS_ERROR
@@ -225,6 +233,11 @@ class TtsFileSaverPlugin : Plugin() {
         runOnExecutor(call) {
             var tmpDir: File? = null
             var mergedFile: File? = null
+            // Xuất file văn bản dài có thể mất nhiều giây đến vài phút — giữ CPU
+            // thức để tránh Doze/App Standby làm treo giữa chừng nếu người dùng
+            // khóa màn hình trong lúc chờ xuất file (cùng nguyên nhân với lúc
+            // đọc qua loa, xem giải thích chi tiết ở acquireWakeLock()).
+            acquireWakeLock()
             try {
                 val engine = tts
                 if (engine == null) {
@@ -385,6 +398,7 @@ class TtsFileSaverPlugin : Plugin() {
                 // tránh rác tích lũy trong cache theo thời gian.
                 try { tmpDir?.deleteRecursively() } catch (_: Throwable) {}
                 try { mergedFile?.delete() } catch (_: Throwable) {}
+                releaseWakeLock()
             }
         }
     }
@@ -548,6 +562,7 @@ class TtsFileSaverPlugin : Plugin() {
                 // (chạy tuần tự, cùng 1 luồng) luôn thấy engine hợp lệ.
                 tts = newTts
                 activeEngineName = engineName.ifBlank { null }
+                configureEngineAudioAttributes(newTts)
 
                 try { oldTts?.stop() } catch (_: Throwable) {}
                 try { oldTts?.shutdown() } catch (_: Throwable) {}
@@ -610,9 +625,12 @@ class TtsFileSaverPlugin : Plugin() {
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
 
                 if (warmup) {
-                    // Xin AudioFocus TƯỜNG MINH và CHỜ xong trước khi phát bất kỳ
-                    // mẫu âm thanh nào — khắc phục việc mất tiếng đầu.
+                    // Xin AudioFocus TƯỜNG MINH và giữ CPU thức (WakeLock) trong
+                    // suốt phiên đọc — cả 2 đều CHỜ xong trước khi phát bất kỳ
+                    // mẫu âm thanh nào, khắc phục việc mất tiếng đầu VÀ việc CPU
+                    // bị Doze làm treo giữa chừng khi khóa màn hình.
                     requestSpeechAudioFocus()
+                    acquireWakeLock()
                     try {
                         engine.playSilentUtterance(300L, TextToSpeech.QUEUE_FLUSH, null)
                     } catch (t: Throwable) {
@@ -679,6 +697,15 @@ class TtsFileSaverPlugin : Plugin() {
                         // kế tiếp đều được nối liền vào hàng đợi CÙNG một engine,
                         // KHÔNG hề rời khỏi vòng lặp Kotlin này -> không có
                         // khoảng trống chờ bridge như kiến trúc cũ.
+                        //
+                        // Kiểm tra lại speakCancelled NGAY TRƯỚC khi gọi speak()
+                        // thật: stopSpeaking() chạy trên luồng khác (luồng gọi
+                        // plugin từ JS) nên có 1 khe hở cực hẹp giữa lúc thoát
+                        // vòng chờ latch của đoạn trước và lúc gọi speak() cho
+                        // đoạn này — nếu đúng lúc đó người dùng bấm Dừng, việc
+                        // check lại ở đây giúp không phát thêm 1 câu thừa sau
+                        // khi đã bấm Dừng.
+                        if (speakCancelled) break@outer
                         val result = try {
                             engine.speak(chunkText, TextToSpeech.QUEUE_ADD, params, utteranceId)
                         } catch (t: Throwable) {
@@ -715,6 +742,11 @@ class TtsFileSaverPlugin : Plugin() {
             } catch (t: Throwable) {
                 Log.e(TAG, "Lỗi khi đọc văn bản: ${t.message}", t)
                 call.reject("Lỗi khi đọc văn bản: ${t.message}")
+            } finally {
+                // Luôn nhả WakeLock khi phiên đọc kết thúc (dù xong xuôi, lỗi
+                // hay bị stopSpeaking() hủy giữa chừng) — không giữ CPU thức
+                // ngoài lúc thật sự cần thiết.
+                releaseWakeLock()
             }
         }
     }
@@ -771,6 +803,36 @@ class TtsFileSaverPlugin : Plugin() {
     // của engine thay vì im lặng đọc sai giọng (hoặc đọc lỗi) mà không báo.
     // ------------------------------------------------------------------
     // ------------------------------------------------------------------
+    // AudioAttributes DÙNG CHUNG cho cả việc xin AudioFocus lẫn cấu hình
+    // chính engine TTS (qua configureEngineAudioAttributes() bên dưới).
+    // LÝ DO: nếu AudioFocus xin cho "usage A" nhưng bản thân TextToSpeech
+    // engine lại tự phát âm thanh trên "usage B" (mặc định khác nhau tuỳ
+    // engine/thiết bị), thì việc "xin giữ loa" và "âm thanh thật sự phát
+    // ra" đi trên 2 luồng khác nhau — hệ thống không ưu tiên/ducking đúng
+    // audio khác đúng như mong đợi, dễ gây xung đột thiết bị đầu ra (ví dụ
+    // nhạc nền không bị hạ âm lượng đúng lúc, hoặc cuộc gọi/thông báo chen
+    // ngang không đúng cách). Dùng chung 1 AudioAttributes đảm bảo khớp
+    // tuyệt đối giữa 2 phía.
+    // ------------------------------------------------------------------
+    private val speechAudioAttributes: AudioAttributes by lazy {
+        AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+
+    // Ép chính engine TTS phát âm thanh đúng theo speechAudioAttributes ở
+    // trên, thay vì để engine tự chọn mặc định riêng của nó (có thể khác
+    // với AudioAttributes ta dùng để xin AudioFocus).
+    private fun configureEngineAudioAttributes(engine: TextToSpeech) {
+        try {
+            engine.setAudioAttributes(speechAudioAttributes)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Không đặt được AudioAttributes cho engine (bỏ qua, dùng mặc định của engine): ${t.message}")
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Xin AudioFocus TƯỜNG MINH trước khi phát giọng nói qua loa.
     // Lý do cần cái này: nếu để TextToSpeech tự xin AudioFocus ngầm bên
     // trong lần speak() đầu tiên, việc xin focus + Android thật sự mở
@@ -785,12 +847,8 @@ class TtsFileSaverPlugin : Plugin() {
         try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 ?: return
-            val attrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
             val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attrs)
+                .setAudioAttributes(speechAudioAttributes)
                 .setAcceptsDelayedFocusGain(false)
                 .build()
             val result = audioManager.requestAudioFocus(request)
@@ -813,6 +871,34 @@ class TtsFileSaverPlugin : Plugin() {
             audioManager.abandonAudioFocusRequest(request)
         } catch (t: Throwable) {
             Log.w(TAG, "Lỗi khi nhả AudioFocus (không quan trọng): ${t.message}")
+        }
+    }
+
+    // Giữ CPU thức (không giữ màn hình sáng) trong lúc đang đọc, để tránh
+    // Doze/App Standby của Android làm treo luồng đọc khi người dùng khóa
+    // màn hình hoặc chuyển sang app khác giữa chừng. Timeout 10 phút là lưới
+    // an toàn cuối cùng, phòng trường hợp release() vì lý do nào đó không
+    // được gọi (ví dụ crash) — không giữ WakeLock vô thời hạn.
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TtsFileSaverPlugin:speak")
+            wl.setReferenceCounted(false)
+            wl.acquire(10 * 60 * 1000L)
+            wakeLock = wl
+        } catch (t: Throwable) {
+            Log.w(TAG, "Không giữ được WakeLock (bỏ qua, không chặn luồng đọc): ${t.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Lỗi khi nhả WakeLock (không quan trọng): ${t.message}")
+        } finally {
+            wakeLock = null
         }
     }
 
@@ -1174,5 +1260,6 @@ class TtsFileSaverPlugin : Plugin() {
         try { tts?.shutdown() } catch (_: Throwable) {}
         try { executor.shutdownNow() } catch (_: Throwable) {}
         try { abandonSpeechAudioFocus() } catch (_: Throwable) {}
+        try { releaseWakeLock() } catch (_: Throwable) {}
     }
 }
