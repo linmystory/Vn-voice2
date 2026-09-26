@@ -751,7 +751,7 @@
   // tách câu bằng splitIntoChunks() y hệt nhánh web, rồi gọi plugin.speak()
   // tuần tự từng câu — nhờ vậy mới biết chính xác "đang ở câu nào" để Tua
   // lùi/Tua tới hoạt động nhất quán giữa 2 chế độ.
-  async function speakNextChunkNative(sessionId) {
+  async function speakNextChunkNative(sessionId, warmup) {
     if (sessionId !== currentSessionId) return;
 
     if (queueIndex >= speechQueue.length) {
@@ -778,7 +778,13 @@
         voiceName: voice ? voice.name : '',
         lang: voice ? voice.lang : 'vi-VN',
         rate: parseFloat(rateSelect.value),
-        pitch: parseFloat(pitchSelect.value)
+        pitch: parseFloat(pitchSelect.value),
+        // true CHỈ ở câu đầu tiên của phiên đọc (mới Phát/Tiếp tục/Tua) để
+        // plugin xin AudioFocus + làm nóng đúng 1 lần; các câu tiếp theo
+        // trong CÙNG phiên phát liên tục truyền false — nếu không, mỗi câu
+        // đều bị chèn thêm khoảng lặng + xin/nhả AudioFocus, gây khựng/ngắt
+        // giữa các câu (đúng là lỗi đang gặp phải).
+        warmup: !!warmup
       });
     } catch (err) {
       if (sessionId !== currentSessionId) return; // bị hủy do bấm Dừng/Tua giữa chừng
@@ -795,6 +801,8 @@
     // sang đọc tiếp đoạn kế, y hệt lỗi đã từng gặp ở nhánh web trước đây.
     if (sessionId !== currentSessionId) return;
     queueIndex += 1;
+    // Gọi tiếp không truyền warmup (mặc định false/undefined) -> câu kế nối
+    // liền ngay, không lặp lại bước làm nóng vì engine vẫn đang "nóng máy".
     speakNextChunkNative(sessionId);
   }
 
@@ -827,7 +835,7 @@
 
     currentSessionId += 1;
     const sessionId = currentSessionId;
-    speakNextChunkNative(sessionId);
+    speakNextChunkNative(sessionId, true);
   }
 
   // Dừng HẲN đoạn đang đọc dở (không phải "tạm dừng" nữa — khái niệm pause
@@ -879,7 +887,7 @@
     currentSessionId += 1;
     const sessionId = currentSessionId;
     if (ttsMode === 'native') {
-      speakNextChunkNative(sessionId);
+      speakNextChunkNative(sessionId, true);
     } else {
       startKeepAlive();
       speakNextChunk(sessionId);
@@ -899,7 +907,7 @@
     if (wasSpeaking) {
       const sessionId = currentSessionId; // dùng lại id vừa tăng trong stopCurrentSpeech()
       if (ttsMode === 'native') {
-        speakNextChunkNative(sessionId);
+        speakNextChunkNative(sessionId, true);
       } else {
         startKeepAlive();
         speakNextChunk(sessionId);
