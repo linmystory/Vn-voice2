@@ -163,62 +163,6 @@
     gap: 12px;
   }
 
-  .btn-main {
-    width: 100%;
-    padding: 18px;
-    font-size: 17px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    border: none;
-    border-radius: 14px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-dim));
-    color: #001018;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    box-shadow: 0 6px 20px var(--accent-glow);
-    transition: transform 0.15s, box-shadow 0.15s;
-  }
-  .btn-main:active { transform: scale(0.98); }
-  .btn-main.speaking {
-    background: linear-gradient(135deg, #ffb300, #ff7300);
-    box-shadow: 0 6px 20px rgba(255,140,0,0.3);
-  }
-  .btn-main:disabled { opacity: 0.5; }
-
-  .btn-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin-top: 10px;
-  }
-
-  .btn-sub {
-    padding: 14px;
-    font-size: 15px;
-    font-weight: 600;
-    border-radius: 12px;
-    border: 1px solid var(--border);
-    background: var(--bg-input);
-    color: var(--text-main);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    transition: 0.15s;
-  }
-  .btn-sub:active { transform: scale(0.97); }
-  .btn-sub.danger { color: var(--danger); border-color: rgba(255,77,109,0.4); }
-  .btn-sub:disabled { opacity: 0.4; }
-  .btn-sub.processing {
-    color: var(--accent);
-    border-color: var(--accent);
-    opacity: 0.8;
-  }
-
   .status-bar {
     display: flex;
     align-items: center;
@@ -262,6 +206,165 @@
   .toast.error { border-color: var(--danger); }
 
   footer { text-align: center; color: var(--text-dim); font-size: 11px; padding: 10px 0 4px; }
+
+  /* ---------- Tầng trên: Lưu âm thanh + Menu chức năng song song ---------- */
+  .top-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    position: relative;
+  }
+  .btn-top {
+    padding: 14px;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg-input);
+    color: var(--text-main);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    transition: 0.15s;
+  }
+  .btn-top:active { transform: scale(0.97); }
+  .btn-top:disabled { opacity: 0.4; }
+  .btn-top.processing { color: var(--accent); border-color: var(--accent); opacity: 0.8; }
+
+  /* Menu chức năng: popover chứa 2 mục ẩn (Danh sách bộ đọc / giọng đọc) */
+  .menu-dropdown {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 100%;
+    max-width: 260px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+    overflow: hidden;
+    z-index: 50;
+    display: none;
+  }
+  .menu-dropdown.open { display: block; }
+  .menu-item {
+    width: 100%;
+    text-align: left;
+    padding: 13px 16px;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-main);
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+  }
+  .menu-item:last-child { border-bottom: none; }
+  .menu-item:active { background: var(--bg-input); }
+  .menu-item-sub { display: block; font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* ---------- Modal chọn Bộ đọc / Giọng đọc (mở từ Menu chức năng) ---------- */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal-sheet {
+    width: 100%;
+    max-width: 640px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 20px 20px 0 0;
+    padding: 18px 16px calc(env(safe-area-inset-bottom, 16px) + 16px);
+    box-shadow: 0 -10px 30px rgba(0,0,0,0.4);
+  }
+  .modal-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .modal-close {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+  }
+
+  /* ---------- Tầng dưới: cụm điều khiển trình phát (đối xứng) ---------- */
+  .player-row {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 14px;
+    margin-top: 14px;
+  }
+  .btn-seek {
+    justify-self: center;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--bg-input);
+    color: var(--text-main);
+    font-size: 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: 0.15s;
+  }
+  .btn-seek:active { transform: scale(0.94); }
+  .btn-seek:disabled { opacity: 0.35; }
+  .btn-play {
+    justify-self: center;
+    width: 84px;
+    height: 84px;
+    border-radius: 50%;
+    border: none;
+    background: linear-gradient(135deg, var(--accent), var(--accent-dim));
+    color: #001018;
+    font-size: 30px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 24px var(--accent-glow);
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .btn-play:active { transform: scale(0.96); }
+  .btn-play.speaking {
+    background: linear-gradient(135deg, #ffb300, #ff7300);
+    box-shadow: 0 8px 24px rgba(255,140,0,0.3);
+  }
+  .btn-play:disabled { opacity: 0.5; }
+  .player-label {
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 6px;
+    letter-spacing: 0.3px;
+  }
 </style>
 </head>
 <body>
@@ -277,18 +380,6 @@
     <div class="textarea-footer">
       <span id="charCount">0 / 25.000</span>
       <button class="btn-clear-small" id="btnClearText">🗑 Xóa nhanh</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">🎙 Bộ đọc &amp; Giọng nói</div>
-    <div class="field">
-      <label for="engineSelect">Bộ đọc (Engine / Nhà cung cấp)</label>
-      <select id="engineSelect"></select>
-    </div>
-    <div class="field">
-      <label for="voiceSelect">Giọng nói</label>
-      <select id="voiceSelect"></select>
     </div>
   </div>
 
@@ -322,17 +413,39 @@
   </div>
 
   <div class="card">
-    <button class="btn-main" id="btnSpeak">
-      <span id="btnSpeakIcon">▶️</span>
-      <span id="btnSpeakLabel">ĐỌC VĂN BẢN</span>
-    </button>
-    <div class="btn-row">
-      <button class="btn-sub" id="btnRewind">⏪ Tua lùi</button>
-      <button class="btn-sub" id="btnForward">⏩ Tua tới</button>
+    <!-- Tầng trên: Lưu âm thanh + Menu chức năng nằm song song -->
+    <div class="top-row">
+      <button class="btn-top" id="btnSaveAudio">💾 Lưu âm thanh</button>
+      <button class="btn-top" id="btnMenu">☰ Menu chức năng</button>
+
+      <div class="menu-dropdown" id="menuDropdown">
+        <button class="menu-item" id="menuItemEngine">
+          🎙️
+          <span>
+            Danh sách bộ đọc
+            <span class="menu-item-sub">Chọn engine / nhà cung cấp giọng đọc</span>
+          </span>
+        </button>
+        <button class="menu-item" id="menuItemVoice">
+          🗣️
+          <span>
+            Danh sách giọng đọc
+            <span class="menu-item-sub">Chọn giọng đọc cụ thể</span>
+          </span>
+        </button>
+      </div>
     </div>
-    <div class="btn-row" style="grid-template-columns: 1fr;">
-      <button class="btn-sub" id="btnSaveAudio">💾 Lưu âm thanh (file WAV)</button>
+
+    <!-- Tầng dưới: cụm điều khiển trình phát, đối xứng 2 bên -->
+    <div class="player-row">
+      <button class="btn-seek" id="btnRewind" title="Tua lùi">⏪</button>
+      <button class="btn-play" id="btnSpeak" title="Phát / Dừng">
+        <span id="btnSpeakIcon">▶️</span>
+      </button>
+      <button class="btn-seek" id="btnForward" title="Tua tới">⏩</button>
     </div>
+    <div class="player-label" id="btnSpeakLabel">ĐỌC VĂN BẢN</div>
+
     <div class="status-bar">
       <span class="dot" id="statusDot"></span>
       <span id="statusText">Sẵn sàng</span>
@@ -340,6 +453,32 @@
   </div>
 
   <footer>Ứng dụng chạy hoàn toàn ngoại tuyến trên thiết bị của bạn</footer>
+</div>
+
+<!-- Modal ẩn: Danh sách bộ đọc (mở từ Menu chức năng) -->
+<div class="modal-overlay" id="engineModalOverlay">
+  <div class="modal-sheet">
+    <div class="modal-title">
+      🎙️ Danh sách bộ đọc
+      <button class="modal-close" id="engineModalClose">✕</button>
+    </div>
+    <div class="field" style="margin-bottom: 0;">
+      <select id="engineSelect"></select>
+    </div>
+  </div>
+</div>
+
+<!-- Modal ẩn: Danh sách giọng đọc (mở từ Menu chức năng) -->
+<div class="modal-overlay" id="voiceModalOverlay">
+  <div class="modal-sheet">
+    <div class="modal-title">
+      🗣️ Danh sách giọng đọc
+      <button class="modal-close" id="voiceModalClose">✕</button>
+    </div>
+    <div class="field" style="margin-bottom: 0;">
+      <select id="voiceSelect"></select>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -386,6 +525,16 @@
   const statusDot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
   const toast = document.getElementById('toast');
+
+  // Menu chức năng (☰) + 2 mục ẩn bên trong: Danh sách bộ đọc / giọng đọc
+  const btnMenu = document.getElementById('btnMenu');
+  const menuDropdown = document.getElementById('menuDropdown');
+  const menuItemEngine = document.getElementById('menuItemEngine');
+  const menuItemVoice = document.getElementById('menuItemVoice');
+  const engineModalOverlay = document.getElementById('engineModalOverlay');
+  const engineModalClose = document.getElementById('engineModalClose');
+  const voiceModalOverlay = document.getElementById('voiceModalOverlay');
+  const voiceModalClose = document.getElementById('voiceModalClose');
 
   const MAX_CHARS = 25000;
   const CHUNK_MAX_LEN = 180;       // độ dài tối đa mỗi đoạn gửi cho TTS (an toàn cho engine Android)
@@ -436,6 +585,63 @@
     updateCharCount();
     textInput.focus();
   });
+
+  // ---------- Menu chức năng (☰): chứa 2 tính năng ẩn ----------
+  // Danh sách bộ đọc & Danh sách giọng đọc không hiện thường trực trên màn
+  // hình chính nữa — chỉ mở ra khi người dùng bấm vào menu này, giúp màn
+  // hình chính gọn gàng hơn. Bản thân <select id="engineSelect"/voiceSelect">
+  // vẫn y hệt trước đây (cùng ID, cùng listener) nên toàn bộ logic chọn bộ
+  // đọc/giọng đọc phía dưới KHÔNG cần đổi gì, chỉ đổi chỗ hiển thị.
+  function closeMenuDropdown() {
+    menuDropdown.classList.remove('open');
+  }
+  function openMenuDropdown() {
+    menuDropdown.classList.add('open');
+  }
+  btnMenu.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (menuDropdown.classList.contains('open')) {
+      closeMenuDropdown();
+    } else {
+      openMenuDropdown();
+    }
+  });
+  // Bấm ra ngoài menu thì tự đóng lại
+  document.addEventListener('click', (e) => {
+    if (!menuDropdown.contains(e.target) && e.target !== btnMenu) {
+      closeMenuDropdown();
+    }
+  });
+
+  function openModal(overlay) {
+    overlay.classList.add('open');
+  }
+  function closeModal(overlay) {
+    overlay.classList.remove('open');
+  }
+
+  menuItemEngine.addEventListener('click', () => {
+    closeMenuDropdown();
+    openModal(engineModalOverlay);
+  });
+  menuItemVoice.addEventListener('click', () => {
+    closeMenuDropdown();
+    openModal(voiceModalOverlay);
+  });
+  engineModalClose.addEventListener('click', () => closeModal(engineModalOverlay));
+  voiceModalClose.addEventListener('click', () => closeModal(voiceModalOverlay));
+  // Bấm vào vùng nền tối bên ngoài tấm modal thì đóng lại (chạm đúng overlay,
+  // không phải bên trong modal-sheet)
+  engineModalOverlay.addEventListener('click', (e) => {
+    if (e.target === engineModalOverlay) closeModal(engineModalOverlay);
+  });
+  voiceModalOverlay.addEventListener('click', (e) => {
+    if (e.target === voiceModalOverlay) closeModal(voiceModalOverlay);
+  });
+  // Chọn xong 1 bộ đọc/giọng đọc thì tự đóng modal luôn cho gọn, khỏi phải
+  // bấm thêm nút đóng.
+  engineSelect.addEventListener('change', () => closeModal(engineModalOverlay));
+  voiceSelect.addEventListener('change', () => closeModal(voiceModalOverlay));
 
   // ---------- Engine name guess ----------
   // Web Speech API không luôn cung cấp "engine name" rõ ràng.
