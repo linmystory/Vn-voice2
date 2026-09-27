@@ -1,5 +1,13 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
+> **Cập nhật v2.3 — rà soát & vá lỗi race condition + double-tap:**
+> - **[Kotlin]** Thêm `@Volatile` cho field `tts` trong `TtsFileSaverPlugin.kt`: field này được ghi từ nhiều luồng (main lúc `load()`, executor lúc `setEngine()`) và đọc trực tiếp từ luồng gọi plugin của Capacitor bridge (`getVoices()`, `shareFile()`) — thiếu `@Volatile` là race condition thật, không đảm bảo luồng đọc thấy giá trị mới nhất.
+> - **[JS]** Chặn bấm đúp nút Phát/Dừng (chế độ native): trước đây khoảng chờ bất đồng bộ giữa lúc bấm và lúc `isSpeaking` chuyển `true` có thể bị bấm đúp lọt qua, tạo 2 lệnh `speak()` chồng lấn trên executor Kotlin — hệ quả là văn bản bị đọc lặp lại, và bấm Dừng có cảm giác app "tự đọc lại" sau đó. Đã thêm cờ `isStartingSpeech` làm mutex.
+> - **[JS]** Chặn bấm đúp nút "Lưu âm thanh": khoá nút (`setSaveButtonState('processing')`) trước đây chạy SAU `await getEngineStatus()`, để hở khoảng bấm đúp tạo 2 file WAV + 2 hộp thoại chia sẻ cùng lúc. Đã chuyển khoá nút lên đồng bộ, trước mọi `await`, và bọc `try/finally` để nút không bao giờ kẹt ở trạng thái "đang xử lý".
+> - **[package.json]** Đồng bộ `@capacitor/cli` từ `8.5.1` lên `8.5.2` cho khớp với `@capacitor/core`/`@capacitor/android` (Capacitor phát hành cả 4 gói cli/core/android/ios cùng version mỗi lần, lệch version là sai sót, đã kiểm tra `8.5.2` tồn tại thật trên npm).
+> - **[CSS]** Dọn khai báo `z-index` bị trùng (200 rồi 999) trong `.toast` — giá trị sau âm thầm đè giá trị trước, không gây lỗi hiển thị nhưng là dead code.
+> - Đã kiểm tra lại (qua web search) toàn bộ version đã ghim ở bản v2.2 bên dưới (Capacitor 8.5.2, Kotlin 2.2.20, AGP 8.13.0, JDK 21, chính sách targetSdk 36 của Google Play có hiệu lực 31/8/2026, issue #8292) — tất cả đều chính xác, không phải thông tin ảo.
+
 > **Cập nhật v2.2 — nâng cấp lên Capacitor 8 (công nghệ mới nhất hiện tại):**
 > - Nâng `@capacitor/core`, `@capacitor/android`, `@capacitor/cli` từ `6.1.2` (đã cũ 2 major version) lên **`8.5.2`/`8.5.1`** — bản ổn định mới nhất tại thời điểm cập nhật.
 > - **Lý do bắt buộc:** từ 31/8/2026, Google Play yêu cầu mọi app mới/bản cập nhật phải target Android 16 (API 36). Capacitor 6 mặc định chỉ target API 34 → sẽ bị Google Play từ chối. Capacitor 8 mặc định target đúng API 36, không cần vá thêm.
