@@ -84,7 +84,19 @@ class TtsFileSaverPlugin : Plugin() {
         private const val STATUS_ERROR = "error"
     }
 
-    private var tts: TextToSpeech? = null
+    // @Volatile BẮT BUỘC: field này được GHI trên nhiều luồng khác nhau —
+    // load() lúc khởi tạo (chạy trên luồng Capacitor tự gọi, KHÔNG phải
+    // executor riêng của class này) và setEngine() khi đổi bộ đọc (chạy trên
+    // executor, qua runOnExecutor) — rồi lại được ĐỌC trực tiếp trên luồng
+    // gọi plugin của Capacitor bridge (getVoices(), shareFile()) và trên
+    // luồng chính (handleOnDestroy()). Nhiều luồng ghi/đọc, KHÔNG luồng nào
+    // đồng bộ hoá với nhau. Thiếu @Volatile, JVM/ART không đảm bảo luồng đọc
+    // thấy được giá trị 'tts' mới nhất ngay sau khi setEngine() gán lại (có
+    // thể đọc phải giá trị cũ/rỗng đã cache trong thanh ghi CPU của luồng đó)
+    // — lỗi race condition kinh điển, khó tái hiện vì thường "tình cờ" chạy
+    // đúng trên nhiều thiết bị/lần chạy, nhưng không được đảm bảo bởi đặc tả
+    // ngôn ngữ.
+    @Volatile private var tts: TextToSpeech? = null
 
     // AudioFocusRequest đang giữ (nếu có) cho phiên đọc hiện tại. Giữ nguyên
     // trong suốt phiên đọc (nhiều câu nối tiếp), CHỈ xin 1 LẦN lúc bắt đầu
