@@ -1,18 +1,16 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
-> **Cập nhật v2.3 — rà soát & vá lỗi race condition + double-tap:**
-> - **[Kotlin]** Thêm `@Volatile` cho field `tts` trong `TtsFileSaverPlugin.kt`: field này được ghi từ nhiều luồng (main lúc `load()`, executor lúc `setEngine()`) và đọc trực tiếp từ luồng gọi plugin của Capacitor bridge (`getVoices()`, `shareFile()`) — thiếu `@Volatile` là race condition thật, không đảm bảo luồng đọc thấy giá trị mới nhất.
-> - **[JS]** Chặn bấm đúp nút Phát/Dừng (chế độ native): trước đây khoảng chờ bất đồng bộ giữa lúc bấm và lúc `isSpeaking` chuyển `true` có thể bị bấm đúp lọt qua, tạo 2 lệnh `speak()` chồng lấn trên executor Kotlin — hệ quả là văn bản bị đọc lặp lại, và bấm Dừng có cảm giác app "tự đọc lại" sau đó. Đã thêm cờ `isStartingSpeech` làm mutex.
-> - **[JS]** Chặn bấm đúp nút "Lưu âm thanh": khoá nút (`setSaveButtonState('processing')`) trước đây chạy SAU `await getEngineStatus()`, để hở khoảng bấm đúp tạo 2 file WAV + 2 hộp thoại chia sẻ cùng lúc. Đã chuyển khoá nút lên đồng bộ, trước mọi `await`, và bọc `try/finally` để nút không bao giờ kẹt ở trạng thái "đang xử lý".
-> - **[package.json]** Đồng bộ `@capacitor/cli` từ `8.5.1` lên `8.5.2` cho khớp với `@capacitor/core`/`@capacitor/android` (Capacitor phát hành cả 4 gói cli/core/android/ios cùng version mỗi lần, lệch version là sai sót, đã kiểm tra `8.5.2` tồn tại thật trên npm).
-> - **[CSS]** Dọn khai báo `z-index` bị trùng (200 rồi 999) trong `.toast` — giá trị sau âm thầm đè giá trị trước, không gây lỗi hiển thị nhưng là dead code.
-> - Đã kiểm tra lại (qua web search) toàn bộ version đã ghim ở bản v2.2 bên dưới (Capacitor 8.5.2, Kotlin 2.2.20, AGP 8.13.0, JDK 21, chính sách targetSdk 36 của Google Play có hiệu lực 31/8/2026, issue #8292) — tất cả đều chính xác, không phải thông tin ảo.
+> **Cập nhật v2.3 — sửa lỗi âm thanh + giao diện gọn hơn:**
+> - **Sửa mất tiếng đầu câu / ngắt quãng giữa chừng khi đọc dài:** nguyên nhân do đọc từng câu qua nhiều lệnh gọi riêng lẻ (round-trip JS↔Kotlin) khiến audio route bị đóng/mở lại liên tục. Đã gộp lại thành **1 lệnh đọc liên tục duy nhất** cho toàn bộ đoạn văn bản, chỉ báo tiến độ qua sự kiện (không cắt luồng phát).
+> - Xin `AudioFocus` tường minh và cấu hình `AudioAttributes` đồng bộ giữa việc "giữ loa" và engine TTS thật sự phát ra — tránh xung đột thiết bị đầu ra.
+> - Thêm `WakeLock` (giữ CPU thức) trong lúc đọc/xuất file dài — tránh Android đưa app vào chế độ tiết kiệm pin (Doze) làm treo audio khi khóa màn hình giữa chừng. **Yêu cầu quyền `WAKE_LOCK`** (quyền thường, không cần xin lúc chạy) — xem bước vá `AndroidManifest.xml` ở cả 2 cách build bên dưới.
+> - **Giao diện thiết kế lại:** gộp nút Phát và Dừng thành 1 nút duy nhất; thêm menu **⚙️ Cài đặt** (góc trên-trái) gom 4 mục Danh sách bộ đọc / Danh sách giọng đọc / Tốc độ đọc / Cao độ giọng nói vào một chỗ, ẩn cho tới khi bấm; nút **💾 Lưu âm thanh** chuyển sang góc trên-phải; đã **bỏ hẳn** 2 nút Tua lùi/Tua tới để màn hình gọn hơn.
 
 > **Cập nhật v2.2 — nâng cấp lên Capacitor 8 (công nghệ mới nhất hiện tại):**
-> - Nâng `@capacitor/core`, `@capacitor/android`, `@capacitor/cli` từ `6.1.2` (đã cũ 2 major version) lên **`8.5.2`/`8.5.1`** — bản ổn định mới nhất tại thời điểm cập nhật.
+> - Nâng `@capacitor/core`, `@capacitor/android`, `@capacitor/cli` từ `6.1.2` (đã cũ 2 major version) lên **`8.5.2`** (đồng bộ cả 3 gói, đúng khuyến nghị chính thức của Capacitor) — bản ổn định mới nhất tại thời điểm cập nhật.
 > - **Lý do bắt buộc:** từ 31/8/2026, Google Play yêu cầu mọi app mới/bản cập nhật phải target Android 16 (API 36). Capacitor 6 mặc định chỉ target API 34 → sẽ bị Google Play từ chối. Capacitor 8 mặc định target đúng API 36, không cần vá thêm.
 > - Nâng Kotlin `1.9.24` → `2.2.20`, JDK `17` → `21`, Node.js `20` → `22` trong CI, đúng theo yêu cầu chính thức của Capacitor 8.
-> - **Lưu ý rủi ro đã biết (chưa build thử được do sandbox không có mạng):** Capacitor 8.5.x mặc định dùng AGP 8.13.0, hiện có 1 issue đang mở trên GitHub của Capacitor về việc Android Studio cảnh báo AGP 8.13.0 chưa được hỗ trợ chính thức (ionic-team/capacitor#8292) — cảnh báo này chủ yếu ảnh hưởng khi mở project bằng Android Studio GUI, không chắc có chặn build dòng lệnh `./gradlew assembleDebug` trong CI hay không. Một issue khác (#8355) về lỗi ProGuard chỉ ảnh hưởng project có dùng `@capacitor/haptics`/`@capacitor/keyboard` — project này không dùng 2 plugin đó nên không bị ảnh hưởng. Nếu CI build lỗi sau khi cập nhật, khả năng cao là do issue #8292 — cân nhắc pin tạm AGP về `8.12.2` trong `android/build.gradle` như một phương án dự phòng.
+> - **Đã build thành công thực tế qua GitHub Actions** (dấu tích xanh, artifact `app-debug-apk` được tạo) — lo ngại trước đây về việc AGP 8.13.0 chưa được hỗ trợ chính thức (ionic-team/capacitor#8292) **không chặn build dòng lệnh** `./gradlew assembleDebug` trong CI như đã lo ngại ban đầu; cảnh báo đó (nếu còn) chỉ xuất hiện khi mở project bằng Android Studio GUI.
 
 > **Cập nhật v2.1:**
 > - Bổ sung `getEnginesWithVoices()` trong plugin native: lấy **toàn bộ bộ đọc (TTS engine)** cài trên máy (Google TTS, Samsung TTS, v.v.) kèm **toàn bộ giọng đọc trong từng bộ đọc** — trước đây chỉ lấy giọng của engine mặc định. Dropdown "Bộ đọc" ở chế độ native giờ liệt kê đầy đủ như chế độ Web Speech API.
@@ -55,6 +53,9 @@ thêm**:
 - Tạo project Android từ Capacitor (`npx cap add android`)
 - Đặt `minSdkVersion = 29` trong `android/variables.gradle` để giới hạn
   ứng dụng chỉ cài được trên Android 10 trở lên
+- Vá `AndroidManifest.xml`: thêm `<queries>` (để thấy hết mọi bộ đọc TTS đã
+  cài trên máy, bắt buộc từ Android 11+) và quyền `WAKE_LOCK` (để không bị
+  ngắt âm thanh khi khóa màn hình giữa lúc đọc dài)
 - Bật hỗ trợ biên dịch Kotlin
 - Copy plugin `TtsFileSaverPlugin.kt` và `MainActivity.java` vào đúng vị trí
 - Build file APK bản debug
@@ -70,6 +71,14 @@ npx cap add android
 # Giới hạn ứng dụng chỉ hỗ trợ Android 10 (API 29) trở lên — sửa dòng
 # minSdkVersion trong android/variables.gradle thành 29 (bằng tay hoặc chạy):
 sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
+
+# QUAN TRỌNG — đừng bỏ qua bước này: vá AndroidManifest.xml để (1) thấy được
+# TẤT CẢ bộ đọc TTS đã cài trên máy chứ không riêng bộ đọc mặc định (bắt buộc
+# từ Android 11+ do cơ chế package visibility), và (2) xin quyền WAKE_LOCK để
+# không bị ngắt âm thanh khi khóa màn hình giữa lúc đang đọc văn bản dài.
+# Thiếu bước này, app vẫn build và chạy được, nhưng sẽ dính lại 2 lỗi đã biết
+# ở trên (không thấy hết bộ đọc / dễ ngắt quãng khi khóa máy).
+sed -i '/<manifest /a\    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <queries>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>' android/app/src/main/AndroidManifest.xml
 
 # Bật hỗ trợ Kotlin cho project Android (chỉ cần làm 1 lần)
 # — xem chi tiết 3 dòng sed trong .github/workflows/build.yml, bước
@@ -144,3 +153,18 @@ Việt:** Máy chưa cài gói giọng tiếng Việt cho engine TTS đang dùng
 đã được vá để tự động rơi về tiếng Anh (thay vì lỗi hẳn) khi ngôn ngữ yêu
 cầu không có sẵn — hãy cài thêm giọng tiếng Việt theo hướng dẫn ở mục
 "Không có bộ đọc khả dụng" phía trên để giọng đọc đúng như mong muốn.
+
+**Âm thanh vẫn mất tiếng đầu câu hoặc ngắt quãng dù đã cập nhật v2.3:**
+Từ v2.3, app đã xin `AudioFocus` tường minh, giữ `WakeLock`, và đọc liên tục
+trong 1 lệnh duy nhất — khắc phục nguyên nhân phổ biến nhất. Nếu vẫn còn gặp
+trên một máy/engine cụ thể:
+1. Kiểm tra xem có đúng đã build lại APK **sau** khi cập nhật lên v2.3 hay
+   đang dùng bản APK cũ (bản vá chỉ có hiệu lực từ lần build mới).
+2. Thử đổi sang bộ đọc khác trong menu ⚙️ Cài đặt — một số engine bên thứ 3
+   (không phải Google TTS) có thể cần thời gian khởi động lâu hơn 300ms mà
+   plugin đang chờ; nếu xác định đúng là do engine cụ thể nào, có thể tăng
+   thời lượng "làm nóng" trong `TtsFileSaverPlugin.kt` (tìm `playSilentUtterance`).
+3. Kiểm tra máy có đang bật chế độ tiết kiệm pin quá mạnh (một số ROM tuỳ
+   biến Trung Quốc có lớp quản lý pin riêng, mạnh hơn cả Doze gốc của
+   Android) — có thể cần thêm ứng dụng vào danh sách "không tối ưu hoá pin"
+   trong Cài đặt hệ thống.
