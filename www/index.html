@@ -160,6 +160,7 @@
     left: 50%;
     bottom: calc(env(safe-area-inset-bottom, 16px) + 20px);
     transform: translateX(-50%) translateY(20px);
+    z-index: 200;
     background: #1e2740;
     border: 1px solid var(--accent);
     color: var(--text-main);
@@ -452,17 +453,6 @@
   let nativeEngineLabels = {}; // { engineKey(package name): label hiển thị } — chỉ dùng khi ttsMode === 'native'
   let allVoices = [];
   let isSpeaking = false;    // đang thực sự phát âm thanh (nút chính đang ở trạng thái ⏹ Dừng)
-  // Chặn bấm đúp nút Phát: từ lúc bấm tới lúc isSpeaking thực sự chuyển true
-  // có 1 khoảng chờ bất đồng bộ (getEngineStatus() ở chế độ native, hoặc chờ
-  // sự kiện onstart ở chế độ web). Nếu người dùng bấm đúp trong khoảng đó,
-  // isSpeaking vẫn đang đọc là false nên nhánh "bắt đầu đọc mới" chạy 2 LẦN
-  // CHỒNG LẤN -> ở chế độ native, lệnh speak() thứ 2 xếp hàng sau lệnh thứ
-  // nhất trên executor của Kotlin (vẫn đang chạy), khiến toàn bộ văn bản bị
-  // đọc lặp lại 1 lần nữa ngay sau khi đọc xong lần đầu — kể cả sau khi đã
-  // bấm Dừng (vì lệnh thứ 2 mới bắt đầu, reset lại cờ hủy của riêng nó),
-  // trông như app "tự đọc lại" không rõ lý do. Cờ này đóng vai trò mutex đơn
-  // giản cho đúng khoảng chờ đó.
-  let isStartingSpeech = false;
   let toastTimer = null;
   let keepAliveTimer = null;
 
@@ -988,40 +978,27 @@
       return;
     }
 
-    // Đang trong khoảng chờ khởi động của MỘT lượt bấm trước đó (xem giải
-    // thích ở khai báo isStartingSpeech) -> bỏ qua lượt bấm đúp này thay vì
-    // khởi động thêm 1 phiên đọc chồng lấn.
-    if (isStartingSpeech) return;
-    isStartingSpeech = true;
-    try {
-      const text = textInput.value;
-      // Hàng đợi rỗng, đã đọc hết toàn bộ, hoặc văn bản đã bị sửa từ lúc dừng
-      // -> coi như đọc mới hoàn toàn từ đầu.
-      if (speechQueue.length === 0 || queueIndex >= speechQueue.length || text !== lastQueueText) {
-        if (ttsMode === 'native') {
-          await startSpeakingNative(text);
-        } else {
-          startSpeakingWeb(text);
-        }
-        return;
-      }
-
-      // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
-      // từ câu đang dừng, KHÔNG đọc lại từ đầu.
+    const text = textInput.value;
+    // Hàng đợi rỗng, đã đọc hết toàn bộ, hoặc văn bản đã bị sửa từ lúc dừng
+    // -> coi như đọc mới hoàn toàn từ đầu.
+    if (speechQueue.length === 0 || queueIndex >= speechQueue.length || text !== lastQueueText) {
       if (ttsMode === 'native') {
-        runNativeSpeech(queueIndex, true);
+        await startSpeakingNative(text);
       } else {
-        currentSessionId += 1;
-        const sessionId = currentSessionId;
-        startKeepAlive();
-        speakNextChunk(sessionId);
+        startSpeakingWeb(text);
       }
-    } finally {
-      // Giải phóng ngay khi chuỗi khởi động (đồng bộ + các await ở trên) đã
-      // xong — không cần chờ hết cả bài đọc, vì lúc này isSpeaking đã true
-      // và các lượt bấm tiếp theo sẽ đi vào nhánh "Dừng" ở đầu hàm, không
-      // còn đi qua cờ này nữa.
-      isStartingSpeech = false;
+      return;
+    }
+
+    // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
+    // từ câu đang dừng, KHÔNG đọc lại từ đầu.
+    if (ttsMode === 'native') {
+      runNativeSpeech(queueIndex, true);
+    } else {
+      currentSessionId += 1;
+      const sessionId = currentSessionId;
+      startKeepAlive();
+      speakNextChunk(sessionId);
     }
   });
 
@@ -1072,31 +1049,25 @@
       return;
     }
 
-    // Chặn bấm đúp: khoá nút NGAY (đồng bộ, TRƯỚC bất kỳ await nào) — nếu để
-    // sau await plugin.getEngineStatus() như bản cũ, khoảng chờ đó là kẽ hở
-    // để 1 lượt bấm thứ 2 lọt qua, tạo 2 file WAV + 2 hộp thoại chia sẻ cùng
-    // lúc. try/finally bên dưới đảm bảo nút luôn được mở khoá lại dù thoát ở
-    // nhánh nào (kể cả các return sớm khi engine lỗi/đang tải).
-    if (btnSaveAudio.disabled) return;
-    setSaveButtonState('processing');
+    try {
+      const engineStatus = await plugin.getEngineStatus();
+      if (engineStatus && engineStatus.status === 'error') {
+        showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
+        return;
+      }
+      if (engineStatus && engineStatus.status === 'loading') {
+        showToast('Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.', true);
+        return;
+      }
+    } catch (e) {
+      // Plugin cũ không có getEngineStatus: bỏ qua bước kiểm tra trước, để
+      // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
+    }
+
+    const voice = getSelectedVoice();
 
     try {
-      try {
-        const engineStatus = await plugin.getEngineStatus();
-        if (engineStatus && engineStatus.status === 'error') {
-          showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
-          return;
-        }
-        if (engineStatus && engineStatus.status === 'loading') {
-          showToast('Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.', true);
-          return;
-        }
-      } catch (e) {
-        // Plugin cũ không có getEngineStatus: bỏ qua bước kiểm tra trước, để
-        // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
-      }
-
-      const voice = getSelectedVoice();
+      setSaveButtonState('processing');
       const result = await plugin.synthesizeToFile({
         text: text,
         voiceName: voice ? voice.name : '',
@@ -1104,6 +1075,8 @@
         rate: parseFloat(rateSelect.value),
         pitch: parseFloat(pitchSelect.value)
       });
+
+      setSaveButtonState('idle');
 
       if (result && result.uri) {
         showToast('Đã lưu file âm thanh: ' + (result.fileName || 'audio.wav'));
@@ -1117,10 +1090,9 @@
         showToast('Không nhận được đường dẫn file sau khi tạo âm thanh.', true);
       }
     } catch (err) {
+      setSaveButtonState('idle');
       const msg = (err && err.message) ? err.message : String(err);
       showToast('Lỗi khi tạo file âm thanh: ' + msg, true);
-    } finally {
-      setSaveButtonState('idle');
     }
   });
 
