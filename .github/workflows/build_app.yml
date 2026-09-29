@@ -35,7 +35,7 @@ jobs:
         ./gradlew bundleRelease assembleRelease -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/keystore.jks -Pandroid.injected.signing.store.password=${{ secrets.STORE_PASSWORD }} -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
 
     - name: Lưu trữ thành phẩm
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v7
       with:
         name: app-release-files
         path: |
