@@ -90,7 +90,7 @@ jobs:
           ./gradlew assembleDebug
 
       - name: Tải APK lên làm "Artifact" để tải về
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
