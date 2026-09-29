@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Lấy mã nguồn từ repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Cài Node.js
         uses: actions/setup-node@v6
