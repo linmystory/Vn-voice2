@@ -1,5 +1,28 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
+> **Cập nhật v2.4 — sửa xung đột TalkBack, tăng tốc lưu file, sửa lỗi không dừng khi xoá văn bản:**
+> - **Xung đột với TalkBack (hoặc bất kỳ app nào dùng chung 1 bộ đọc):** khi 2 ứng
+>   dụng cùng dùng chung một engine TTS, TalkBack giành quyền nói bằng cách xoá
+>   sạch hàng đợi của engine đó (`QUEUE_DESTROY`) — Android báo việc này qua
+>   `onStop()`, một callback mà bản cũ **không hề xử lý**, nên cứ đứng im chờ hết
+>   giờ (30 giây khi đọc, còn khi lưu file thì báo lỗi ngay) thay vì đọc/lưu tiếp.
+>   Dùng bộ đọc RIÊNG (khác bộ đọc TalkBack đang dùng) thì không đụng hàng đợi
+>   nên vẫn bình thường — đúng như hiện tượng đã mô tả. Đã vá: coi `onStop()`
+>   không phải do chính mình gây ra là "bị chen ngang", tự động xếp lại đúng
+>   câu/đoạn đó sau một khoảng nghỉ ngắn, cả khi đọc qua loa lẫn khi xuất file.
+> - **Lưu âm thanh quá lâu:** 2 nguyên nhân được tìm thấy và sửa — (1) nếu đang
+>   đọc dở qua loa mà bấm Lưu, việc lưu file phải xếp hàng chờ đọc xong toàn bộ
+>   văn bản mới bắt đầu (nay tự động dừng đọc trước); (2) mỗi đoạn văn bản trước
+>   đây phải xong hẳn rồi mới gửi đoạn kế cho engine (nay xếp sẵn nhiều đoạn theo
+>   kiểu "băng chuyền", engine luôn có việc để làm ngay), và bỏ hẳn bước ghép file
+>   trung gian (ghi thẳng vào bộ nhớ máy). Có thêm thanh tiến độ "Đang tạo file...
+>   x/y đoạn" để biết app vẫn đang chạy, không phải bị treo.
+> - **Xoá văn bản trong lúc đang đọc nhưng app vẫn tiếp tục đọc:** nay hễ ô nhập
+>   văn bản trở nên rỗng (xoá tay hoặc bấm "Xoá nhanh") trong lúc đang đọc, app
+>   tự động dừng ngay lập tức.
+> - Thêm `aria-label`/`aria-live` cho các nút và vùng trạng thái để tương thích
+>   tốt hơn khi chính người dùng TalkBack điều khiển app này.
+
 > **Cập nhật v2.3 — sửa lỗi âm thanh + giao diện gọn hơn:**
 > - **Sửa mất tiếng đầu câu / ngắt quãng giữa chừng khi đọc dài:** nguyên nhân do đọc từng câu qua nhiều lệnh gọi riêng lẻ (round-trip JS↔Kotlin) khiến audio route bị đóng/mở lại liên tục. Đã gộp lại thành **1 lệnh đọc liên tục duy nhất** cho toàn bộ đoạn văn bản, chỉ báo tiến độ qua sự kiện (không cắt luồng phát).
 > - Xin `AudioFocus` tường minh và cấu hình `AudioAttributes` đồng bộ giữa việc "giữ loa" và engine TTS thật sự phát ra — tránh xung đột thiết bị đầu ra.
