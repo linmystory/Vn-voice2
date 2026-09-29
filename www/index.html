@@ -329,7 +329,7 @@
 <div class="app">
   <div class="topbar">
     <div class="settings-wrap">
-      <button class="icon-btn" id="btnSettings" title="Cài đặt">⚙️</button>
+      <button class="icon-btn" id="btnSettings" title="Cài đặt" aria-label="Mở cài đặt giọng đọc" aria-haspopup="true" aria-expanded="false">⚙️</button>
       <div class="settings-panel" id="settingsPanel">
         <div class="settings-panel-title">🎛️ Cài đặt giọng đọc</div>
         <div class="field">
@@ -382,14 +382,14 @@
 
   <div class="card">
     <div class="player-row">
-      <button class="btn-play" id="btnSpeak" title="Phát / Dừng">
-        <span id="btnSpeakIcon">▶️</span>
+      <button class="btn-play" id="btnSpeak" title="Phát / Dừng" aria-label="Phát văn bản">
+        <span id="btnSpeakIcon" aria-hidden="true">▶️</span>
       </button>
     </div>
     <div class="player-label" id="btnSpeakLabel">ĐỌC VĂN BẢN</div>
 
-    <div class="status-bar">
-      <span class="dot" id="statusDot"></span>
+    <div class="status-bar" role="status" aria-live="polite">
+      <span class="dot" id="statusDot" aria-hidden="true"></span>
       <span id="statusText">Sẵn sàng</span>
     </div>
   </div>
@@ -487,12 +487,36 @@
       charCount.classList.add('limit-near');
     }
   }
-  textInput.addEventListener('input', updateCharCount);
+
+  // ---------- BUG: xoá văn bản trong lúc đang đọc nhưng app vẫn tiếp tục đọc ----------
+  // Nguyên nhân: trước đây không có nơi nào theo dõi nội dung ô nhập trong lúc
+  // đang phát — chỉ có nút Dừng mới ngắt đọc. Từ giờ: bất cứ khi nào ô nhập
+  // TRỞ NÊN RỖNG (xoá hết chữ hoặc bấm "Xoá nhanh") trong lúc đang đọc, tự
+  // động dừng ngay, không đợi người dùng bấm nút Dừng — vì tiếp tục đọc nội
+  // dung đã biến mất khỏi màn hình rất khó hiểu, đặc biệt với người dùng
+  // TalkBack (không nhìn thấy ô nhập còn chữ hay không).
+  async function stopIfTextClearedWhileSpeaking() {
+    if (!isSpeaking) return;
+    if (textInput.value.trim() !== '') return;
+    await stopCurrentSpeech();
+    resetQueueState();
+    setSpeakingUI(false);
+    statusText.textContent = 'Đã dừng do văn bản bị xoá';
+  }
+
+  textInput.addEventListener('input', () => {
+    updateCharCount();
+    stopIfTextClearedWhileSpeaking();
+  });
 
   btnClearText.addEventListener('click', () => {
     textInput.value = '';
     updateCharCount();
     textInput.focus();
+    // Gán .value bằng JS KHÔNG tự bắn sự kiện 'input' của trình duyệt (chỉ
+    // gõ/dán tay mới bắn) -> phải gọi tường minh ở đây, nếu không bấm nút
+    // này trong lúc đang đọc sẽ không dừng được (đúng lỗi đã gặp phải).
+    stopIfTextClearedWhileSpeaking();
   });
 
   // ---------- Menu Cài đặt (⚙️): gom Danh sách bộ đọc / giọng đọc / Tốc độ / Cao độ ----------
@@ -504,9 +528,11 @@
   // KHÔNG cần đổi gì, chỉ đổi chỗ hiển thị.
   function closeSettingsPanel() {
     settingsPanel.classList.remove('open');
+    btnSettings.setAttribute('aria-expanded', 'false');
   }
   function openSettingsPanel() {
     settingsPanel.classList.add('open');
+    btnSettings.setAttribute('aria-expanded', 'true');
   }
   btnSettings.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -728,6 +754,7 @@
     btnSpeak.classList.toggle('speaking', speaking);
     btnSpeakIcon.textContent = speaking ? '⏹' : '▶️';
     btnSpeakLabel.textContent = speaking ? 'DỪNG ĐỌC' : (hasUnfinishedQueue() ? 'TIẾP TỤC ĐỌC' : 'ĐỌC VĂN BẢN');
+    btnSpeak.setAttribute('aria-label', speaking ? 'Dừng đọc' : (hasUnfinishedQueue() ? 'Tiếp tục đọc văn bản' : 'Phát văn bản'));
     statusDot.classList.toggle('active', speaking);
   }
 
@@ -870,6 +897,14 @@
         updateProgressStatus();
       }
     });
+    // Tiến độ khi đang LƯU FILE (không phải đọc qua loa) — xem lý do thêm ở
+    // handler btnSaveAudio bên dưới: cho người dùng thấy app đang chạy thật,
+    // không phải bị "đơ", nhất là khi văn bản dài mất nhiều thời gian tổng hợp.
+    plugin.addListener('saveProgress', (data) => {
+      if (data && typeof data.done === 'number' && typeof data.total === 'number' && data.total > 0) {
+        statusText.textContent = `Đang tạo file âm thanh… ${data.done}/${data.total} đoạn`;
+      }
+    });
   }
 
   async function runNativeSpeech(startIndex, warmup) {
@@ -889,9 +924,10 @@
     queueIndex = startIndex;
     updateProgressStatus();
 
+    let result;
     try {
       // 1 LỆNH GỌI DUY NHẤT cho toàn bộ phần còn lại — xem giải thích ở trên.
-      await plugin.speak({
+      result = await plugin.speak({
         chunks: speechQueue,
         startIndex: startIndex,
         voiceName: voice ? voice.name : '',
@@ -910,11 +946,26 @@
 
     // plugin.speak() chỉ thật sự "resolve xong" khi TOÀN BỘ câu đã đọc hết
     // hoặc bị stopSpeaking() hủy giữa chừng. Nếu đã bị một lệnh mới hơn
-    // (Dừng/Tua) vô hiệu hóa session này thì bỏ qua, phần code xử lý
-    // Dừng/Tua đã tự cập nhật UI của riêng nó rồi.
+    // (Dừng/Tua/Lưu file) vô hiệu hóa session này thì bỏ qua, phần code xử lý
+    // thao tác đó đã tự cập nhật UI của riêng nó rồi.
     if (sessionId !== currentSessionId) return;
     setSpeakingUI(false);
-    statusText.textContent = 'Đã đọc xong';
+
+    // Xử lý theo kết quả THẬT trả về (bản cũ luôn báo "Đã đọc xong" bất kể vì
+    // sao dừng lại, kể cả khi dừng do lỗi hoặc bị bộ đọc khác — ví dụ TalkBack
+    // — chiếm dụng engine quá lâu).
+    if (result && result.failed) {
+      const msg = result.failReason === 'preempted'
+        ? 'Bộ đọc đang bận phục vụ ứng dụng khác (ví dụ TalkBack) quá lâu nên đã dừng lại. Hãy thử lại, hoặc đổi sang một bộ đọc khác trong Cài đặt để tránh dùng chung bộ đọc với TalkBack.'
+        : 'Bộ máy đọc gặp lỗi liên tục nên đã dừng lại. Hãy thử lại, hoặc đổi sang một bộ đọc khác trong Cài đặt.';
+      showToast(msg, true);
+      statusText.textContent = 'Đã dừng do lỗi';
+    } else if (!result || !result.cancelled) {
+      statusText.textContent = 'Đã đọc xong';
+    }
+    // Nếu result.cancelled === true: đây là do người dùng chủ động Dừng/Tua/
+    // Lưu file — nơi gọi thao tác đó đã tự đặt statusText phù hợp rồi, không
+    // ghi đè ở đây.
   }
 
   async function startSpeakingNative(text) {
@@ -1049,6 +1100,18 @@
       return;
     }
 
+    // QUAN TRỌNG (khắc phục "lưu âm thanh quá lâu"): app chỉ dùng 1 bộ máy
+    // TTS duy nhất cho cả việc đọc qua loa lẫn xuất file, và bộ máy đó chỉ
+    // làm được 1 việc tại 1 thời điểm. Nếu đang đọc dở mà không dừng trước,
+    // việc lưu file phải NẰM CHỜ đọc xong toàn bộ văn bản rồi mới bắt đầu —
+    // với văn bản dài, cảm giác y hệt "bấm Lưu mà không thấy phản hồi gì".
+    // Phía Kotlin cũng tự ép dừng phòng hờ, nhưng dừng từ đây giúp giao diện
+    // cập nhật NGAY LẬP TỨC thay vì đợi tới lúc đó mới biết.
+    if (isSpeaking) {
+      await stopCurrentSpeech();
+      setSpeakingUI(false);
+    }
+
     try {
       const engineStatus = await plugin.getEngineStatus();
       if (engineStatus && engineStatus.status === 'error') {
@@ -1064,10 +1127,15 @@
       // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
     }
 
+    // Đăng ký listener TRƯỚC khi gọi synthesizeToFile(), không sau — nếu đăng
+    // ký sau, sự kiện saveProgress đầu tiên (thường bắn ra rất sớm) có thể lỡ mất.
+    setupNativeListeners();
+
     const voice = getSelectedVoice();
 
     try {
       setSaveButtonState('processing');
+      statusText.textContent = 'Đang tạo file âm thanh…';
       const result = await plugin.synthesizeToFile({
         text: text,
         voiceName: voice ? voice.name : '',
@@ -1077,6 +1145,7 @@
       });
 
       setSaveButtonState('idle');
+      statusText.textContent = 'Sẵn sàng';
 
       if (result && result.uri) {
         showToast('Đã lưu file âm thanh: ' + (result.fileName || 'audio.wav'));
@@ -1091,6 +1160,7 @@
       }
     } catch (err) {
       setSaveButtonState('idle');
+      statusText.textContent = 'Sẵn sàng';
       const msg = (err && err.message) ? err.message : String(err);
       showToast('Lỗi khi tạo file âm thanh: ' + msg, true);
     }
