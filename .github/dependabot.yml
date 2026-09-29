@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # 1. Tự quét và nâng cấp các công cụ trong GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # 2. Tự quét và nâng cấp các thư viện Android trong file build.gradle
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
