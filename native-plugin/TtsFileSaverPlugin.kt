@@ -66,10 +66,14 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 @CapacitorPlugin(name = "TtsFileSaver")
 class TtsFileSaverPlugin : Plugin() {
@@ -115,6 +119,70 @@ class TtsFileSaverPlugin : Plugin() {
     // hạn thực tế do TextToSpeech.getMaxSpeechInputLength() cung cấp, nhưng ta
     // dùng một ngưỡng an toàn nhỏ hơn để tránh lỗi trên các máy/engine khác nhau.
     private val SAFE_CHUNK_LEN = 350
+
+    // ------------------------------------------------------------------
+    // XUNG ĐỘT VỚI TALKBACK / ỨNG DỤNG KHÁC DÙNG CHUNG BỘ ĐỌC (TTS ENGINE)
+    //
+    // Khi ta và TalkBack (trình đọc màn hình của Google) cùng dùng MỘT engine,
+    // TalkBack phát giọng bằng chế độ QUEUE_DESTROY: chế độ này xoá sạch hàng
+    // đợi của TẤT CẢ ứng dụng đang dùng chung engine để TalkBack nói trước
+    // (AOSP: "Talkback uses it to preempt other users of TextToSpeech queue").
+    // Framework báo việc này cho ta qua UtteranceProgressListener.onStop() —
+    // KHÔNG phải onDone/onError. Bản cũ không xử lý onStop nên cứ đứng chờ hết
+    // 30 giây (đọc) hoặc 20 giây (lưu file, rồi báo lỗi) mới đi tiếp. Khi dùng
+    // bộ đọc RIÊNG (khác bộ đọc của TalkBack) thì TalkBack không chạm tới
+    // hàng đợi của ta nên mọi thứ bình thường — đúng với hiện tượng người dùng
+    // mô tả. Cách xử lý: coi onStop không do mình gây ra là "bị chen ngang" và
+    // tự xếp lại đúng đoạn đó vào hàng đợi (sau lời của TalkBack).
+    // ------------------------------------------------------------------
+    private val OUTCOME_PENDING = 0
+    private val OUTCOME_DONE = 1
+    private val OUTCOME_ERROR = 2
+    private val OUTCOME_STOPPED = 3
+
+    // Số lần thử lại tối đa cho 1 đoạn khi engine báo LỖI thật.
+    private val MAX_ERROR_RETRIES = 2
+
+    // Số lần thử lại tối đa cho 1 đoạn khi bị bộ đọc khác chen ngang. Đặt cao vì
+    // người dùng TalkBack có thể vuốt liên tục; mỗi lần chờ tăng dần tới 1,5 giây.
+    private val MAX_PREEMPT_RETRIES = 40
+
+    // Mỗi lần gửi đoạn cho engine dùng 1 utteranceId DUY NHẤT (không trùng giữa
+    // các phiên đọc/lần thử): tránh việc callback trễ của phiên cũ bị nhầm với
+    // đoạn mới có cùng số thứ tự.
+    private val utteranceSeq = AtomicLong(0)
+    private fun newUtteranceId(prefix: String): String = "${prefix}_${utteranceSeq.incrementAndGet()}"
+
+    // Chờ (có thể bị ngắt) — trả về false nếu người dùng đã bấm Dừng trong lúc chờ.
+    private fun sleepUnlessCancelled(ms: Long): Boolean {
+        val end = System.currentTimeMillis() + ms
+        while (System.currentTimeMillis() < end) {
+            if (speakCancelled) return false
+            try {
+                Thread.sleep(minOf(50L, end - System.currentTimeMillis()).coerceAtLeast(1L))
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return !speakCancelled
+    }
+
+    // Đoạn dùng khi XUẤT FILE: lớn hơn đoạn đọc trực tiếp vì tổng hợp ra file
+    // không cần phản hồi tức thì; ít đoạn hơn = ít lần gọi engine hơn = nhanh hơn
+    // (mỗi lần gọi engine có chi phí cố định vài chục tới vài trăm ms). Vẫn thấp
+    // hơn nhiều so với giới hạn TextToSpeech.getMaxSpeechInputLength() (4000).
+    private val FILE_CHUNK_LEN = 800
+
+    // Số đoạn được xếp hàng trước cho engine khi xuất file. Engine luôn có sẵn
+    // việc để làm ngay khi vừa xong đoạn trước (không còn khoảng trống chờ ta
+    // nhận callback rồi mới gửi đoạn kế như bản cũ).
+    private val FILE_PIPELINE_DEPTH = 3
+
+    // Thời gian chờ tối đa (giây) cho MỖI kết quả của engine khi xuất file. Engine
+    // xử lý tuần tự nên đây chính là thời gian tối đa cho 1 đoạn (~800 ký tự);
+    // chỉ dùng để phát hiện engine "im lặng" hẳn, không phải giới hạn tốc độ.
+    private val FILE_EVENT_TIMEOUT_SEC = 90L
 
     override fun load() {
         super.load()
@@ -213,6 +281,17 @@ class TtsFileSaverPlugin : Plugin() {
             return
         }
         if (!ensureReadyOrReject(call)) return
+
+        // Nếu đang đọc dở qua loa: DỪNG NGAY để việc lưu file không phải xếp hàng
+        // chờ đọc xong. Mọi thao tác engine dùng chung 1 luồng xử lý duy nhất và
+        // engine chỉ làm được 1 việc mỗi lúc, nên nếu không dừng đọc trước thì việc
+        // lưu file có thể phải chờ hết cả bài đọc (hàng chục phút với văn bản dài)
+        // mới bắt đầu — đây là nguyên nhân khiến "lưu âm thanh quá lâu".
+        speakCancelled = true
+        try { tts?.stop() } catch (_: Throwable) {}
+        currentLatch?.countDown()
+        abandonSpeechAudioFocus()
+
         // Android 10+ dùng MediaStore/scoped storage => không cần xin quyền
         // lưu trữ lúc chạy, tổng hợp file ngay.
         doSynthesizeToFile(call)
@@ -232,7 +311,6 @@ class TtsFileSaverPlugin : Plugin() {
 
         runOnExecutor(call) {
             var tmpDir: File? = null
-            var mergedFile: File? = null
             // Xuất file văn bản dài có thể mất nhiều giây đến vài phút — giữ CPU
             // thức để tránh Doze/App Standby làm treo giữa chừng nếu người dùng
             // khóa màn hình trong lúc chờ xuất file (cùng nguyên nhân với lúc
@@ -246,11 +324,13 @@ class TtsFileSaverPlugin : Plugin() {
                 }
 
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
-                val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
+                // Xuất file dùng đoạn LỚN hơn đoạn đọc trực tiếp (xem FILE_CHUNK_LEN).
+                val chunks = splitIntoChunks(text, FILE_CHUNK_LEN)
                 if (chunks.isEmpty()) {
                     call.reject("Văn bản rỗng sau khi xử lý.")
                     return@runOnExecutor
                 }
+                val total = chunks.size
 
                 val workDir = File(context.cacheDir, "tts_tmp_${System.currentTimeMillis()}")
                 if (!workDir.mkdirs() && !workDir.exists()) {
@@ -259,117 +339,229 @@ class TtsFileSaverPlugin : Plugin() {
                 }
                 tmpDir = workDir
 
-                // "Làm nóng" bộ máy tổng hợp giọng nói TRƯỚC khi ghi đoạn thật.
-                // Nguyên nhân mất đoạn đầu trong file WAV: nhiều engine TTS
-                // (đặc biệt Google TTS) cần thời gian khởi động backend tổng
-                // hợp ở lần synthesizeToFile() đầu tiên sau khi đổi giọng/
-                // ngôn ngữ hoặc sau một thời gian không dùng -> vài trăm ms
-                // âm thanh đầu tiên bị thiếu hoặc nhiễu trong file xuất ra.
-                // Khắc phục: tổng hợp trước một ký tự vô nghĩa ra file tạm
-                // rồi xoá bỏ ngay, coi như "mồi" cho engine chạy nóng máy;
-                // KHÔNG dùng playSilentUtterance ở đây vì nó phát ra loa
-                // thật, không phù hợp khi mục đích chỉ là xuất file.
-                val warmupFile = File(workDir, "warmup.wav")
-                val warmupUtteranceId = "warmup_${System.currentTimeMillis()}"
-                val warmupLatch = CountDownLatch(1)
+                // ------------------------------------------------------------
+                // Bộ theo dõi kết quả từng đoạn (dùng chung cho warm-up và các
+                // đoạn thật). Mỗi utteranceId chỉ được ghi nhận ĐÚNG 1 lần (được
+                // remove khỏi map ngay khi có callback đầu tiên) nên callback
+                // trùng lặp hoặc đến muộn của phiên trước bị bỏ qua tự động.
+                // onStop = bị xoá khỏi hàng đợi bởi bộ đọc khác dùng chung engine
+                // (TalkBack dùng QUEUE_DESTROY) -> sẽ được xếp lại, không báo lỗi.
+                // ------------------------------------------------------------
+                val pendingIds = ConcurrentHashMap<String, Int>()
+                val events = LinkedBlockingQueue<IntArray>()
                 engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    private fun post(id: String?, outcome: Int) {
+                        val key = id ?: return
+                        val index = pendingIds.remove(key) ?: return
+                        events.offer(intArrayOf(index, outcome))
+                    }
                     override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) {
-                        if (id == warmupUtteranceId) warmupLatch.countDown()
-                    }
+                    override fun onDone(id: String?) { post(id, OUTCOME_DONE) }
                     @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) {
-                        if (id == warmupUtteranceId) warmupLatch.countDown()
-                    }
-                    override fun onError(id: String?, errorCode: Int) {
-                        if (id == warmupUtteranceId) warmupLatch.countDown()
-                    }
+                    override fun onError(id: String?) { post(id, OUTCOME_ERROR) }
+                    override fun onError(id: String?, errorCode: Int) { post(id, OUTCOME_ERROR) }
+                    override fun onStop(id: String?, interrupted: Boolean) { post(id, OUTCOME_STOPPED) }
                 })
+
+                // "Làm nóng" engine: tổng hợp 1 đoạn cực ngắn ra file tạm rồi bỏ kết
+                // quả. Chỉ chờ tối đa 1,5 giây (bản cũ chờ tới 5 giây và dùng văn bản
+                // chỉ gồm dấu chấm: nhiều engine không gọi callback cho văn bản như
+                // vậy nên lần lưu nào cũng phí trọn 5 giây).
+                val warmupFile = File(workDir, "warmup.wav")
+                val warmupId = newUtteranceId("warmup")
+                pendingIds[warmupId] = -1
                 try {
-                    val warmupResult = engine.synthesizeToFile(".", Bundle(), warmupFile, warmupUtteranceId)
+                    val warmupResult = engine.synthesizeToFile("Xin chào.", Bundle(), warmupFile, warmupId)
                     if (warmupResult == TextToSpeech.SUCCESS) {
-                        warmupLatch.await(5, TimeUnit.SECONDS)
+                        events.poll(1500L, TimeUnit.MILLISECONDS)
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "Làm nóng engine tổng hợp thất bại (bỏ qua, không ảnh hưởng file thật): ${t.message}")
                 } finally {
-                    warmupFile.delete()
+                    pendingIds.remove(warmupId)
+                    events.clear()
+                    try { warmupFile.delete() } catch (_: Throwable) {}
                 }
 
-                val chunkFiles = ArrayList<File>()
-                var synthesisFailed = false
-                var failMessage = ""
+                // ------------------------------------------------------------
+                // Tổng hợp theo kiểu "băng chuyền" (pipeline): luôn xếp sẵn tối đa
+                // FILE_PIPELINE_DEPTH đoạn trong hàng đợi của engine, mỗi khi xong
+                // 1 đoạn thì bù ngay 1 đoạn mới. Engine không bao giờ phải ngồi
+                // chờ ta nhận callback rồi mới gửi đoạn kế như bản cũ.
+                // ------------------------------------------------------------
+                val errorAttempts = IntArray(total)
+                val preemptAttempts = IntArray(total)
+                val retryQueue = java.util.ArrayDeque<Int>()
+                var nextToSubmit = 0
+                var inFlight = 0
+                var doneCount = 0
+                var failMessage: String? = null
 
-                for ((index, chunkText) in chunks.withIndex()) {
-                    val chunkFile = File(workDir, "chunk_%04d.wav".format(index))
-                    val utteranceId = "chunk_$index"
-                    val latch = CountDownLatch(1)
-                    var thisChunkFailed = false
+                fun chunkFileOf(index: Int): File = File(workDir, "chunk_%05d.wav".format(index))
 
-                    val listener = object : UtteranceProgressListener() {
-                        override fun onStart(id: String?) {}
-                        override fun onDone(id: String?) {
-                            if (id == utteranceId) latch.countDown()
-                        }
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(id: String?) {
-                            if (id == utteranceId) {
-                                thisChunkFailed = true
-                                latch.countDown()
-                            }
-                        }
-                        override fun onError(id: String?, errorCode: Int) {
-                            if (id == utteranceId) {
-                                thisChunkFailed = true
-                                latch.countDown()
-                            }
-                        }
-                    }
-
-                    engine.setOnUtteranceProgressListener(listener)
-
-                    val params = Bundle()
-                    val result = try {
-                        engine.synthesizeToFile(chunkText, params, chunkFile, utteranceId)
+                fun submit(index: Int): Boolean {
+                    val file = chunkFileOf(index)
+                    try { file.delete() } catch (_: Throwable) {}
+                    val uid = newUtteranceId("file_$index")
+                    pendingIds[uid] = index
+                    val r = try {
+                        engine.synthesizeToFile(chunks[index], Bundle(), file, uid)
                     } catch (t: Throwable) {
                         Log.e(TAG, "synthesizeToFile ném lỗi ở đoạn ${index + 1}: ${t.message}", t)
                         TextToSpeech.ERROR
                     }
-                    if (result != TextToSpeech.SUCCESS) {
-                        thisChunkFailed = true
-                        latch.countDown()
+                    if (r != TextToSpeech.SUCCESS) {
+                        pendingIds.remove(uid)
+                        return false
                     }
+                    return true
+                }
 
-                    // Chờ tối đa 20 giây cho mỗi đoạn (đoạn đã được giới hạn ngắn nên rất hiếm khi cần lâu vậy)
-                    val finished = try {
-                        latch.await(20, TimeUnit.SECONDS)
+                // Báo tiến độ cho JS để người dùng thấy app đang chạy (không "đơ").
+                fun reportProgress() {
+                    try {
+                        val p = JSObject()
+                        p.put("done", doneCount)
+                        p.put("total", total)
+                        notifyListeners("saveProgress", p)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Không gửi được sự kiện saveProgress: ${t.message}")
+                    }
+                }
+
+                // Nghỉ có thể bị ngắt; trả false nếu luồng bị huỷ giữa chừng.
+                fun pause(ms: Long): Boolean {
+                    return try {
+                        Thread.sleep(ms)
+                        true
                     } catch (ie: InterruptedException) {
                         Thread.currentThread().interrupt()
                         false
                     }
-                    if (!finished || thisChunkFailed || !chunkFile.exists() || chunkFile.length() == 0L) {
-                        synthesisFailed = true
-                        failMessage = "Không thể tổng hợp đoạn văn bản thứ ${index + 1}/${chunks.size}."
-                        break
-                    }
-                    chunkFiles.add(chunkFile)
                 }
 
-                if (synthesisFailed) {
+                reportProgress()
+
+                while (doneCount < total && failMessage == null) {
+                    // 1) Bù cho đủ FILE_PIPELINE_DEPTH đoạn đang xếp hàng trong engine.
+                    while (inFlight < FILE_PIPELINE_DEPTH && failMessage == null) {
+                        val index = when {
+                            !retryQueue.isEmpty() -> retryQueue.pollFirst() ?: -1
+                            nextToSubmit < total -> nextToSubmit++
+                            else -> -1
+                        }
+                        if (index < 0) break
+                        if (submit(index)) {
+                            inFlight++
+                        } else {
+                            // Engine từ chối nhận ngay (thường do dịch vụ đang kết nối lại).
+                            errorAttempts[index]++
+                            if (errorAttempts[index] > MAX_ERROR_RETRIES) {
+                                failMessage = "Bộ máy đọc từ chối nhận đoạn văn bản thứ ${index + 1}/$total."
+                            } else {
+                                retryQueue.addFirst(index)
+                                if (!pause(400L * errorAttempts[index])) failMessage = "Quá trình tạo file bị gián đoạn."
+                                break
+                            }
+                        }
+                    }
+                    if (failMessage != null) break
+
+                    if (inFlight == 0) {
+                        // Không còn gì đang chạy: hoặc vừa có đoạn cần gửi lại (vòng sau sẽ
+                        // gửi), hoặc — không thể xảy ra bình thường — đã mất dấu đoạn nào đó.
+                        if (retryQueue.isEmpty() && nextToSubmit >= total && doneCount < total) {
+                            failMessage = "Quá trình tạo file bị gián đoạn bất thường. Vui lòng thử lại."
+                        }
+                        continue
+                    }
+
+                    // 2) Chờ đúng 1 kết quả (engine xử lý tuần tự nên mỗi lần chỉ xong 1 đoạn).
+                    val event = try {
+                        events.poll(FILE_EVENT_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        failMessage = "Quá trình tạo file bị gián đoạn."
+                        null
+                    }
+                    if (failMessage != null) break
+
+                    if (event == null) {
+                        // Engine im lặng quá lâu: dọn hàng đợi của ta rồi xếp lại toàn bộ
+                        // các đoạn đang chờ (mỗi đoạn được tính 1 lần thử lại).
+                        val stuck = ArrayList<Int>(pendingIds.values)
+                        pendingIds.clear()
+                        try { engine.stop() } catch (_: Throwable) {}
+                        events.clear()
+                        inFlight = 0
+                        for (idx in stuck) {
+                            errorAttempts[idx]++
+                            if (errorAttempts[idx] > MAX_ERROR_RETRIES) {
+                                failMessage = "Bộ máy đọc không phản hồi ở đoạn văn bản thứ ${idx + 1}/$total."
+                            } else {
+                                retryQueue.addLast(idx)
+                            }
+                        }
+                        continue
+                    }
+
+                    inFlight--
+                    val index = event[0]
+                    when (event[1]) {
+                        OUTCOME_DONE -> {
+                            val f = chunkFileOf(index)
+                            if (f.exists() && f.length() > 0L) {
+                                doneCount++
+                                reportProgress()
+                            } else {
+                                // Engine báo xong nhưng không có dữ liệu -> coi như lỗi, thử lại.
+                                errorAttempts[index]++
+                                if (errorAttempts[index] > MAX_ERROR_RETRIES) {
+                                    failMessage = "Không thể tổng hợp đoạn văn bản thứ ${index + 1}/$total."
+                                } else {
+                                    retryQueue.addLast(index)
+                                }
+                            }
+                        }
+                        OUTCOME_STOPPED -> {
+                            // Bị bộ đọc khác (TalkBack...) chen ngang: xếp lại đúng đoạn này
+                            // sau một khoảng nghỉ ngắn để bộ đọc kia nói xong.
+                            preemptAttempts[index]++
+                            if (preemptAttempts[index] > MAX_PREEMPT_RETRIES) {
+                                failMessage = "Bộ đọc đang bận phục vụ ứng dụng khác (ví dụ TalkBack) quá lâu. Vui lòng thử lại sau."
+                            } else {
+                                retryQueue.addLast(index)
+                                if (!pause(minOf(250L * preemptAttempts[index], 1500L))) failMessage = "Quá trình tạo file bị gián đoạn."
+                            }
+                        }
+                        else -> {
+                            errorAttempts[index]++
+                            if (errorAttempts[index] > MAX_ERROR_RETRIES) {
+                                failMessage = "Không thể tổng hợp đoạn văn bản thứ ${index + 1}/$total."
+                            } else {
+                                retryQueue.addLast(index)
+                                if (!pause(400L * errorAttempts[index])) failMessage = "Quá trình tạo file bị gián đoạn."
+                            }
+                        }
+                    }
+                }
+
+                if (failMessage != null) {
+                    // Thất bại: xoá sạch hàng đợi còn sót trong engine (nếu không engine vẫn
+                    // tiếp tục tổng hợp vào các file tạm sắp bị xoá) rồi báo lỗi.
+                    pendingIds.clear()
+                    try { engine.stop() } catch (_: Throwable) {}
                     call.reject(failMessage)
                     return@runOnExecutor
                 }
 
-                // Ghép các file WAV nhỏ thành 1 file WAV hoàn chỉnh
-                val outFile = File(context.cacheDir, "tts_output_${System.currentTimeMillis()}.wav")
-                mergedFile = outFile
-                mergeWavFiles(chunkFiles, outFile)
-
-                // Lưu file vào bộ nhớ công khai (Music/DocDocTTS) qua MediaStore
-                // (Android 10+, không cần xin quyền runtime), đồng thời trả về
-                // content Uri để JS có thể chia sẻ/mở file.
+                // Ghép các đoạn thành 1 file WAV và GHI THẲNG vào MediaStore (Music/
+                // DocDocTTS, Android 10+ không cần xin quyền runtime) — không tạo file
+                // ghép trung gian nên bớt 1 lượt ghi + 1 lượt đọc toàn bộ dữ liệu âm
+                // thanh (file WAV dài có thể tới hàng chục MB).
+                val chunkFiles = (0 until total).map { chunkFileOf(it) }
                 val fileName = "doc-van-ban-${System.currentTimeMillis()}.wav"
-                val savedUri = saveWavToPublicStorage(outFile, fileName)
+                val savedUri = saveMergedWavToPublicStorage(chunkFiles, fileName)
 
                 if (savedUri == null) {
                     call.reject("Không thể lưu file âm thanh vào bộ nhớ thiết bị.")
@@ -397,7 +589,6 @@ class TtsFileSaverPlugin : Plugin() {
                 // Dọn dẹp file/thư mục tạm nếu còn sót lại do lỗi giữa chừng,
                 // tránh rác tích lũy trong cache theo thời gian.
                 try { tmpDir?.deleteRecursively() } catch (_: Throwable) {}
-                try { mergedFile?.delete() } catch (_: Throwable) {}
                 releaseWakeLock()
             }
         }
@@ -587,9 +778,10 @@ class TtsFileSaverPlugin : Plugin() {
 
     @PluginMethod
     fun speak(call: PluginCall) {
-        // "chunks": mảng các câu (JS đã tách sẵn bằng splitIntoChunks, dùng
-        // chung với logic Tua lùi/Tua tới). Vẫn nhận "text" đơn lẻ để tương
-        // thích ngược nếu có bản JS cũ hơn chưa gửi mảng.
+        // "chunks": mảng các câu (JS đã tách sẵn bằng splitIntoChunks, để biết
+        // chính xác đang đọc tới câu nào mà "đọc tiếp" đúng chỗ sau khi Dừng).
+        // Vẫn nhận "text" đơn lẻ để tương thích ngược nếu có bản JS cũ hơn
+        // chưa gửi mảng.
         val chunksArray = call.getArray("chunks")
         val sentences: List<String> = if (chunksArray != null && chunksArray.length() > 0) {
             (0 until chunksArray.length()).map { i -> chunksArray.optString(i, "") }
@@ -648,17 +840,23 @@ class TtsFileSaverPlugin : Plugin() {
                 // khựng LẶP LẠI ở MỌI câu (đúng lỗi đang gặp). Đọc liền mạch
                 // trong 1 vòng lặp Kotlin duy nhất mới đảm bảo QUEUE_ADD nối
                 // liền các câu mà không có khoảng trống chờ bridge.
-                // Tua lùi/Tua tới vẫn hoạt động được nhờ báo tiến độ qua
-                // notifyListeners("speakProgress") bên dưới, JS chỉ cần lắng
-                // nghe để cập nhật vị trí, không cần tự gọi lại từng câu.
+                // Vị trí đang đọc được báo về JS qua notifyListeners("speakProgress")
+                // bên dưới, JS chỉ cần lắng nghe để cập nhật tiến độ, không cần tự
+                // gọi lại từng câu.
                 // ------------------------------------------------------------
                 var lastIndexReached = startIndex
+                // Chỉ số câu cuối cùng đã đọc XONG hoàn toàn (mọi đoạn con đều xong).
+                var lastCompletedIndex = startIndex - 1
+                // true nếu phải dừng vì engine liên tục lỗi / liên tục bị chen ngang.
+                var failed = false
+                var failReason = ""
+
                 outer@ for (sentenceIndex in startIndex until sentences.size) {
                     if (speakCancelled) break@outer
                     lastIndexReached = sentenceIndex
 
-                    // Báo cho JS biết ĐANG bắt đầu đọc câu này (để Tua lùi/Tua
-                    // tới và thanh tiến độ luôn khớp với audio thật đang phát).
+                    // Báo cho JS biết ĐANG bắt đầu đọc câu này (để thanh tiến độ và
+                    // vị trí "đọc tiếp" luôn khớp với audio thật đang phát).
                     try {
                         val progress = JSObject()
                         progress.put("index", sentenceIndex)
@@ -668,77 +866,136 @@ class TtsFileSaverPlugin : Plugin() {
                     }
 
                     val subChunks = splitIntoChunks(sentences[sentenceIndex], SAFE_CHUNK_LEN)
-                    if (subChunks.isEmpty()) continue
+                    if (subChunks.isEmpty()) {
+                        lastCompletedIndex = sentenceIndex
+                        continue
+                    }
 
                     for ((subIdx, chunkText) in subChunks.withIndex()) {
-                        if (speakCancelled) break@outer
-                        val utteranceId = "speak_${sentenceIndex}_$subIdx"
-                        val latch = CountDownLatch(1)
-                        currentLatch = latch
-                        var errored = false
+                        var errorRetries = 0
+                        var preemptRetries = 0
+                        var chunkDone = false
 
-                        val listener = object : UtteranceProgressListener() {
-                            override fun onStart(id: String?) {}
-                            override fun onDone(id: String?) {
-                                if (id == utteranceId) latch.countDown()
-                            }
-                            @Deprecated("Deprecated in Java")
-                            override fun onError(id: String?) {
-                                if (id == utteranceId) { errored = true; latch.countDown() }
-                            }
-                            override fun onError(id: String?, errorCode: Int) {
-                                if (id == utteranceId) { errored = true; latch.countDown() }
-                            }
-                        }
-                        engine.setOnUtteranceProgressListener(listener)
+                        // Vòng thử lại cho CHÍNH đoạn này: chỉ sang đoạn kế khi đoạn
+                        // này đã phát xong thật sự (onDone), không bỏ sót nội dung.
+                        while (!chunkDone) {
+                            if (speakCancelled) break@outer
 
-                        val params = Bundle()
-                        // QUEUE_ADD luôn luôn: cả sub-chunk trong cùng câu lẫn câu
-                        // kế tiếp đều được nối liền vào hàng đợi CÙNG một engine,
-                        // KHÔNG hề rời khỏi vòng lặp Kotlin này -> không có
-                        // khoảng trống chờ bridge như kiến trúc cũ.
-                        //
-                        // Kiểm tra lại speakCancelled NGAY TRƯỚC khi gọi speak()
-                        // thật: stopSpeaking() chạy trên luồng khác (luồng gọi
-                        // plugin từ JS) nên có 1 khe hở cực hẹp giữa lúc thoát
-                        // vòng chờ latch của đoạn trước và lúc gọi speak() cho
-                        // đoạn này — nếu đúng lúc đó người dùng bấm Dừng, việc
-                        // check lại ở đây giúp không phát thêm 1 câu thừa sau
-                        // khi đã bấm Dừng.
-                        if (speakCancelled) break@outer
-                        val result = try {
-                            engine.speak(chunkText, TextToSpeech.QUEUE_ADD, params, utteranceId)
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "speak() ném lỗi ở câu $sentenceIndex, đoạn $subIdx: ${t.message}", t)
-                            TextToSpeech.ERROR
-                        }
-                        if (result != TextToSpeech.SUCCESS) {
-                            errored = true
-                            latch.countDown()
-                        }
+                            val utteranceId = newUtteranceId("speak_${sentenceIndex}_$subIdx")
+                            val latch = CountDownLatch(1)
+                            currentLatch = latch
+                            val outcome = AtomicInteger(OUTCOME_PENDING)
 
-                        try {
-                            latch.await(30, TimeUnit.SECONDS)
-                        } catch (ie: InterruptedException) {
-                            Thread.currentThread().interrupt()
+                            // compareAndSet đảm bảo mỗi lần gửi chỉ có ĐÚNG MỘT kết
+                            // quả được ghi nhận (callback đến từ luồng binder, có thể
+                            // đồng thời/trùng lặp).
+                            val listener = object : UtteranceProgressListener() {
+                                override fun onStart(id: String?) {}
+                                override fun onDone(id: String?) {
+                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_DONE)) latch.countDown()
+                                }
+                                @Deprecated("Deprecated in Java")
+                                override fun onError(id: String?) {
+                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) latch.countDown()
+                                }
+                                override fun onError(id: String?, errorCode: Int) {
+                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) latch.countDown()
+                                }
+                                // Bị dừng/xoá khỏi hàng đợi: do CHÍNH ta (stopSpeaking)
+                                // hoặc do bộ đọc khác dùng chung engine (TalkBack...)
+                                // chen ngang bằng QUEUE_DESTROY.
+                                override fun onStop(id: String?, interrupted: Boolean) {
+                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_STOPPED)) latch.countDown()
+                                }
+                            }
+                            engine.setOnUtteranceProgressListener(listener)
+
+                            // Kiểm tra lại speakCancelled NGAY TRƯỚC khi gọi speak()
+                            // thật: stopSpeaking() chạy trên luồng khác nên có 1 khe
+                            // hở cực hẹp; check lại giúp không phát thêm câu thừa
+                            // sau khi người dùng đã bấm Dừng.
+                            if (speakCancelled) break@outer
+                            val result = try {
+                                engine.speak(chunkText, TextToSpeech.QUEUE_ADD, Bundle(), utteranceId)
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "speak() ném lỗi ở câu $sentenceIndex, đoạn $subIdx: ${t.message}", t)
+                                TextToSpeech.ERROR
+                            }
+                            if (result != TextToSpeech.SUCCESS && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) {
+                                latch.countDown()
+                            }
+
+                            // Thời gian chờ tối đa tỉ lệ với độ dài đoạn và TỐC ĐỘ ĐỌC:
+                            // đọc chậm (0.5x) một đoạn dài có thể mất cả phút, không
+                            // được coi là treo. Chỉ để phát hiện engine "im lặng" hẳn.
+                            val timeoutSec = 20L + (chunkText.length / (5.0f * rate.coerceAtLeast(0.25f))).toLong()
+                            val finished = try {
+                                latch.await(timeoutSec, TimeUnit.SECONDS)
+                            } catch (ie: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                                false
+                            }
+                            currentLatch = null
+
+                            if (speakCancelled) break@outer
+
+                            if (!finished) {
+                                // Engine không phản hồi gì trong suốt thời gian chờ ->
+                                // coi là lỗi, dọn hàng đợi của ta rồi thử lại.
+                                if (outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) {
+                                    try { engine.stop() } catch (_: Throwable) {}
+                                }
+                            }
+
+                            when (outcome.get()) {
+                                OUTCOME_DONE -> chunkDone = true
+                                OUTCOME_STOPPED -> {
+                                    // Bị chen ngang (TalkBack...): xếp lại đúng đoạn này
+                                    // sau một khoảng nghỉ ngắn để bộ đọc kia nói xong.
+                                    preemptRetries++
+                                    if (preemptRetries > MAX_PREEMPT_RETRIES) {
+                                        failed = true
+                                        failReason = "preempted"
+                                        break@outer
+                                    }
+                                    if (!sleepUnlessCancelled(minOf(250L * preemptRetries, 1500L))) break@outer
+                                }
+                                else -> {
+                                    errorRetries++
+                                    if (errorRetries > MAX_ERROR_RETRIES) {
+                                        failed = true
+                                        failReason = "engine_error"
+                                        break@outer
+                                    }
+                                    if (!sleepUnlessCancelled(400L * errorRetries)) break@outer
+                                }
+                            }
                         }
-                        currentLatch = null
-                        if (speakCancelled || errored) break@outer
                     }
+                    lastCompletedIndex = sentenceIndex
                 }
 
-                val finishedNaturally = !speakCancelled && lastIndexReached >= sentences.size - 1
+                val completedAll = !speakCancelled && !failed && lastCompletedIndex >= sentences.size - 1
                 try {
                     val done = JSObject()
                     done.put("cancelled", speakCancelled)
+                    done.put("failed", failed)
                     done.put("lastIndex", lastIndexReached)
-                    done.put("finished", finishedNaturally)
+                    done.put("finished", completedAll)
                     notifyListeners("speakDone", done)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Không gửi được sự kiện speakDone: ${t.message}")
                 }
 
-                call.resolve()
+                // Trả kết quả THẬT về cho JS (bản cũ trả rỗng nên JS luôn báo "Đã
+                // đọc xong" kể cả khi đọc dừng giữa chừng vì lỗi).
+                val ret = JSObject()
+                ret.put("finished", completedAll)
+                ret.put("cancelled", speakCancelled)
+                ret.put("failed", failed)
+                ret.put("failReason", failReason)
+                ret.put("lastIndex", lastIndexReached)
+                call.resolve(ret)
             } catch (t: Throwable) {
                 Log.e(TAG, "Lỗi khi đọc văn bản: ${t.message}", t)
                 call.reject("Lỗi khi đọc văn bản: ${t.message}")
@@ -759,7 +1016,7 @@ class TtsFileSaverPlugin : Plugin() {
             // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
             // tiếp theo (xếp hàng sau trên cùng 1 executor) phải chờ tới 30 giây.
             currentLatch?.countDown()
-            // Dừng hẳn -> nhả AudioFocus. Phiên đọc TIẾP THEO (Phát lại/Tua)
+            // Dừng hẳn -> nhả AudioFocus. Phiên đọc TIẾP THEO (bấm Phát lại)
             // sẽ tự gửi warmup=true và xin lại focus + làm nóng từ đầu.
             abandonSpeechAudioFocus()
             call.resolve()
@@ -1109,34 +1366,41 @@ class TtsFileSaverPlugin : Plugin() {
     }
 
     // ------------------------------------------------------------------
-    // Ghép nhiều file WAV nhỏ thành 1 file WAV hoàn chỉnh (dùng chung định dạng
+    // Ghi nhiều file WAV nhỏ thành 1 luồng WAV hoàn chỉnh (dùng chung định dạng
     // âm thanh của file đầu tiên; chỉ ghi phần dữ liệu PCM thật của mỗi file,
     // xác định đúng vị trí nhờ readWavInfo ở trên thay vì offset cố định).
-    // Đọc/ghi theo luồng bằng bộ đệm cố định 8KB để tránh nạp cả file vào RAM
-    // (an toàn hơn với văn bản dài, giảm nguy cơ OutOfMemoryError).
+    // Đọc/ghi theo luồng bằng bộ đệm cố định 64KB để tránh nạp cả file vào RAM
+    // (an toàn với văn bản dài) mà vẫn ít lệnh đọc/ghi hệ thống hơn hẳn bộ đệm 8KB.
     // ------------------------------------------------------------------
-    private fun mergeWavFiles(files: List<File>, outFile: File) {
+    private fun writeMergedWav(files: List<File>, infos: List<WavInfo>, out: java.io.OutputStream) {
         if (files.isEmpty()) throw IOException("Không có đoạn âm thanh nào để ghép.")
 
-        val infos = files.map { readWavInfo(it) }
         val first = infos[0]
+        // Các đoạn phải cùng định dạng (tần số lấy mẫu/kênh/độ sâu bit) mới ghép
+        // thẳng được; khác nhau thì file ra sẽ bị nhanh/chậm/rè mà không báo lỗi.
+        for (i in 1 until infos.size) {
+            val cur = infos[i]
+            if (cur.sampleRate != first.sampleRate || cur.channels != first.channels || cur.bitsPerSample != first.bitsPerSample) {
+                Log.w(TAG, "Đoạn ${i + 1} có định dạng âm thanh khác đoạn đầu " +
+                    "(${cur.sampleRate}Hz/${cur.channels}ch/${cur.bitsPerSample}bit so với " +
+                    "${first.sampleRate}Hz/${first.channels}ch/${first.bitsPerSample}bit).")
+            }
+        }
         val totalDataSize = infos.sumOf { it.dataSize }
 
-        java.io.BufferedOutputStream(java.io.FileOutputStream(outFile)).use { out ->
-            writeWavHeader(out, totalDataSize, first.sampleRate, first.channels, first.bitsPerSample, first.byteRate, first.blockAlign)
-            files.forEachIndexed { i, f ->
-                val info = infos[i]
-                RandomAccessFile(f, "r").use { raf ->
-                    raf.seek(info.dataOffset)
-                    var remaining = info.dataSize
-                    val buffer = ByteArray(8192)
-                    while (remaining > 0) {
-                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                        val n = raf.read(buffer, 0, toRead)
-                        if (n < 0) break
-                        out.write(buffer, 0, n)
-                        remaining -= n
-                    }
+        writeWavHeader(out, totalDataSize, first.sampleRate, first.channels, first.bitsPerSample, first.byteRate, first.blockAlign)
+        val buffer = ByteArray(65536)
+        files.forEachIndexed { i, f ->
+            val info = infos[i]
+            RandomAccessFile(f, "r").use { raf ->
+                raf.seek(info.dataOffset)
+                var remaining = info.dataSize
+                while (remaining > 0) {
+                    val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                    val n = raf.read(buffer, 0, toRead)
+                    if (n < 0) break
+                    out.write(buffer, 0, n)
+                    remaining -= n
                 }
             }
         }
@@ -1209,10 +1473,15 @@ class TtsFileSaverPlugin : Plugin() {
     }
 
     // ------------------------------------------------------------------
-    // Lưu file WAV vào bộ nhớ công khai của thiết bị (Music/DocDocTTS)
-    // Dùng MediaStore (Android 10+, không cần xin quyền runtime).
+    // Ghép các đoạn WAV và lưu THẲNG vào bộ nhớ công khai của thiết bị
+    // (Music/DocDocTTS) qua MediaStore (Android 10+, không cần xin quyền runtime),
+    // không qua file ghép trung gian.
     // ------------------------------------------------------------------
-    private fun saveWavToPublicStorage(sourceFile: File, displayName: String): Uri? {
+    private fun saveMergedWavToPublicStorage(chunkFiles: List<File>, displayName: String): Uri? {
+        // Đọc thông tin header TRƯỚC khi tạo bản ghi MediaStore: nếu có đoạn hỏng thì
+        // báo lỗi ngay, không để lại 1 bản ghi rác trong thư viện nhạc của người dùng.
+        val infos = chunkFiles.map { readWavInfo(it) }
+
         val resolver = context.contentResolver
 
         val values = ContentValues().apply {
@@ -1226,9 +1495,9 @@ class TtsFileSaverPlugin : Plugin() {
 
         var writeOk = false
         try {
-            resolver.openOutputStream(itemUri)?.use { out ->
-                FileInputStream(sourceFile).use { input ->
-                    input.copyTo(out)
+            resolver.openOutputStream(itemUri)?.let { rawOut ->
+                java.io.BufferedOutputStream(rawOut, 65536).use { out ->
+                    writeMergedWav(chunkFiles, infos, out)
                 }
                 writeOk = true
             }
