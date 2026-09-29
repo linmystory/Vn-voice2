@@ -1,0 +1,43 @@
+name: Build APK and AAB from ZIP
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Lấy dữ liệu về
+      uses: actions/checkout@v3
+
+    - name: Cài đặt môi trường Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Tự động giải nén code
+      run: |
+        if [ -f "code.zip" ]; then
+          unzip -o code.zip -d .
+        fi
+
+    - name: Lấy chìa khóa ra giải mã
+      run: |
+        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > keystore.jks
+
+    - name: Cấp quyền đóng gói
+      run: chmod +x gradlew
+
+    - name: Đóng gói APK và AAB
+      run: |
+        ./gradlew bundleRelease assembleRelease -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/keystore.jks -Pandroid.injected.signing.store.password=${{ secrets.STORE_PASSWORD }} -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+
+    - name: Lưu trữ thành phẩm
+      uses: actions/upload-artifact@v3
+      with:
+        name: app-release-files
+        path: |
+          app/build/outputs/bundle/release/*.aab
+          app/build/outputs/apk/release/*.apk
