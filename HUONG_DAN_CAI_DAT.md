@@ -81,7 +81,50 @@ thêm**:
   ngắt âm thanh khi khóa màn hình giữa lúc đọc dài)
 - Bật hỗ trợ biên dịch Kotlin
 - Copy plugin `TtsFileSaverPlugin.kt` và `MainActivity.java` vào đúng vị trí
-- Build file APK bản debug
+- Build file APK bản debug (luôn chạy) + APK/AAB bản release đã ký (chỉ chạy
+  nếu đã cấu hình đủ 4 secret ở mục ngay dưới đây — nếu chưa, workflow tự bỏ
+  qua các bước này, không làm hỏng bản debug)
+
+### (Tùy chọn) Bật build bản release đã ký — để đăng lên Google Play
+
+Bản debug ở trên đủ để cài thử trên điện thoại, nhưng Google Play **bắt buộc**
+phải là bản đã ký bằng khóa riêng (keystore) của bạn và ở định dạng `.aab`
+(Android App Bundle). Làm 1 lần duy nhất:
+
+**Bước 1 — Tạo keystore** (bỏ qua nếu đã có sẵn 1 file `.jks`/`.keystore` từ
+trước — dùng lại đúng file đó, **không tạo mới**, vì mỗi lần cập nhật app lên
+Play sau này đều phải ký bằng đúng 1 keystore duy nhất, làm mất là không thể
+cập nhật app cũ được nữa):
+```bash
+keytool -genkeypair -v -keystore release-keystore.jks -alias doc-van-ban \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+Lệnh sẽ hỏi vài thông tin (tên, tổ chức...) rồi hỏi 2 mật khẩu — **ghi nhớ
+thật kỹ, mất là không khôi phục được**.
+
+**Bước 2 — Mã hóa keystore thành base64** (để dán vào GitHub Secret dạng chữ):
+```bash
+base64 -w0 release-keystore.jks > keystore.b64.txt
+```
+Mở file `keystore.b64.txt`, copy toàn bộ nội dung (1 chuỗi ký tự rất dài).
+
+**Bước 3 — Thêm 4 Secret vào GitHub:** vào repo → **Settings** → **Secrets
+and variables** → **Actions** → **New repository secret**, tạo lần lượt:
+
+| Tên secret          | Giá trị                                              |
+|---------------------|-------------------------------------------------------|
+| `KEYSTORE_BASE64`   | Toàn bộ nội dung file `keystore.b64.txt` ở Bước 2      |
+| `KEYSTORE_PASSWORD` | Mật khẩu keystore đã đặt ở Bước 1                      |
+| `KEY_ALIAS`         | `doc-van-ban` (hoặc alias bạn đã đặt ở Bước 1)         |
+| `KEY_PASSWORD`      | Mật khẩu key đã đặt ở Bước 1                           |
+
+Chạy lại workflow (push code mới hoặc bấm **Run workflow**) — job sẽ xuất
+hiện thêm artifact **`app-release-signed`** chứa cả `.apk` và `.aab` đã ký
+sẵn, tải `.aab` lên Google Play Console để đăng app.
+
+⚠️ **Không bao giờ** commit file `.jks`/`.keystore` hay dán mật khẩu thẳng
+vào code — chỉ đưa qua GitHub Secrets như trên. Log của Actions tự động che
+(`***`) mọi giá trị secret nên không lộ ra dù build lỗi.
 
 ## Cách 2 — Build thủ công trên máy tính (cần Android Studio / Android SDK)
 
