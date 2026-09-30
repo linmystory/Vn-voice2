@@ -1014,6 +1014,20 @@
     }
   }
 
+  // Đọc tiếp đúng từ câu đang dừng (queueIndex), dùng chung cho: (1) bấm nút
+  // Phát khi đang ở trạng thái dừng dở, (2) đổi Tốc độ/Cao độ/Giọng đọc TRONG
+  // LÚC đang đọc (xem applySettingsChangeWhileSpeaking bên dưới).
+  function resumeReadingFromCurrentPosition() {
+    if (ttsMode === 'native') {
+      runNativeSpeech(queueIndex, true);
+    } else {
+      currentSessionId += 1;
+      const sessionId = currentSessionId;
+      startKeepAlive();
+      speakNextChunk(sessionId);
+    }
+  }
+
   btnSpeak.addEventListener('click', async () => {
     if (ttsMode !== 'native' && ttsMode !== 'web') {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
@@ -1043,15 +1057,29 @@
 
     // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
     // từ câu đang dừng, KHÔNG đọc lại từ đầu.
-    if (ttsMode === 'native') {
-      runNativeSpeech(queueIndex, true);
-    } else {
-      currentSessionId += 1;
-      const sessionId = currentSessionId;
-      startKeepAlive();
-      speakNextChunk(sessionId);
-    }
+    resumeReadingFromCurrentPosition();
   });
+
+  // ---------- BUG: đổi Tốc độ đọc / Cao độ giọng nói / Giọng đọc TRONG LÚC
+  // đang đọc không có tác dụng gì, phải dừng rồi đọc lại mới thấy đổi ----------
+  // Nguyên nhân: voiceSelect/rateSelect/pitchSelect trước đây KHÔNG có sự kiện
+  // 'change' nào cả — giá trị 3 ô này chỉ được đọc vào đúng thời điểm hàm
+  // speak()/synthesizeToFile() được GỌI (xem runNativeSpeech, speakNextChunk),
+  // nên đổi lựa chọn giữa lúc app đang đọc dở hoàn toàn không được áp dụng,
+  // phải tự bấm Dừng rồi Phát lại mới thấy hiệu lực — đúng hiện tượng "không
+  // điều chỉnh được tốc độ khi đang đọc".
+  // Sửa: đổi 1 trong 3 mục này TRONG LÚC đang đọc -> tự dừng câu hiện tại rồi
+  // đọc tiếp NGAY với thông số mới (câu đang đọc dở sẽ đọc lại từ đầu câu đó,
+  // vì TTS không hỗ trợ tua tới giữa 1 câu đang phát) — cảm giác như đổi có
+  // hiệu lực ngay lập tức thay vì phải tự bấm Dừng/Phát thủ công.
+  async function applySettingsChangeWhileSpeaking() {
+    if (!isSpeaking) return; // chưa đọc -> giá trị mới tự áp dụng ở lần Phát kế tiếp, không cần làm gì
+    await stopCurrentSpeech();
+    resumeReadingFromCurrentPosition();
+  }
+  rateSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
+  pitchSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
+  voiceSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
 
 
   // Nếu người dùng chuyển ứng dụng / tắt màn hình, khi quay lại kiểm tra và
