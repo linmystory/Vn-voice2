@@ -13,7 +13,7 @@ jobs:
     steps:
       - name: Lấy thông tin bản cập nhật
         id: metadata
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
 
       - name: Tự động bấm duyệt thay người dùng
         run: gh pr merge --auto --merge "$PR_URL"
